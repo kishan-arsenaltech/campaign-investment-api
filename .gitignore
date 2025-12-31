@@ -1,0 +1,20 @@
+﻿################################################################################
+# This .gitignore file was automatically created by Microsoft(R) Visual Studio.
+################################################################################
+
+/.vs
+/Investment/.vs
+/Investment/bin/Debug/net9.0
+/Investment/obj
+/Investment.Core/bin/Debug/net9.0
+/Investment.Core/obj
+/Investment.Repo/bin/Debug/net9.0
+/Investment.Repo/obj/Debug/net9.0
+/Investment.Repo/obj
+/Investment.Service/bin/Debug/net9.0
+/Investment.Service/obj/Debug/net9.0
+/Investment.Service/obj/Investment.Service.csproj.nuget.dgspec.json
+/Investment.Service/obj/Investment.Service.csproj.nuget.g.props
+/Investment.Service/obj/Investment.Service.csproj.nuget.g.targets
+/Investment.Service/obj/project.assets.json
+/Investment.Service/obj/project.nuget.cache
