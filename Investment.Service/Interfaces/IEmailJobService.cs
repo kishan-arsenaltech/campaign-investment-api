@@ -2,6 +2,6 @@
 {
     public interface IEmailJobService
     {
-        Task SendDafReminderEmailsAsync();
+        Task SendReminderEmailsAsync(string jobName);
     }
 }

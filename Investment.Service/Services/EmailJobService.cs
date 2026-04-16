@@ -1,8 +1,11 @@
-﻿using Investment.Core.Entities;
+﻿using Invest.Core.Settings;
+using Investment.Core.Constants;
+using Investment.Core.Entities;
 using Investment.Repo.Context;
 using Investment.Service.Interfaces;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using System.Globalization;
 
 namespace Investment.Service.Services
 {
@@ -10,118 +13,132 @@ namespace Investment.Service.Services
     {
         private readonly IMailService _mailService;
         private readonly RepositoryContext _context;
-        private readonly string baseUrl;
+        private readonly AppSecrets _appSecrets;
+        private readonly EmailQueue _emailQueue;
         private const string Day3 = "Day3";
         private const string Week2 = "Week2";
 
-        public EmailJobService(IMailService mailService, RepositoryContext context, IConfiguration config)
+        public EmailJobService(IMailService mailService, RepositoryContext context, AppSecrets appSecrets, EmailQueue emailQueue)
         {
             _mailService = mailService;
             _context = context;
-
-            var envName = config["environment:name"]?.ToLower();
-            baseUrl = envName switch
-            {
-                "qa" => "",
-                "prod" => "",
-                _ => ""
-            };
+            _appSecrets = appSecrets;
+            _emailQueue = emailQueue;
         }
 
-        public async Task SendDafReminderEmailsAsync()
+        public async Task SendReminderEmailsAsync(string jobName)
         {
-            var logEntry = new SchedulerLogs
-            {
-                StartTime = DateTime.Now
-            };
-
             int day3Count = 0;
             int week2Count = 0;
 
+            var logEntry = new SchedulerLogs
+            {
+                StartTime = DateTime.Now,
+                JobName = jobName
+            };
+
             try
             {
-                var pendingGrants = await _context.PendingGrants
-                                                .Where(x => x.status!.ToLower().Trim() == "pending"
-                                                            && x.DAFProvider.ToLower().Trim() != "foundation grant"
-                                                            && !string.IsNullOrWhiteSpace(x.DAFProvider)
-                                                            && x.CreatedDate.HasValue
-                                                            && (
-                                                                    EF.Functions.DateDiffDay(x.CreatedDate.Value, DateTime.Now) == 3 ||
-                                                                    EF.Functions.DateDiffDay(x.CreatedDate.Value, DateTime.Now) == 14
-                                                               )
-                                                            )
-                                                .Include(x => x.User)
-                                                .Include(x => x.Campaign)
-                                                .Select(x => new
-                                                {
-                                                    Grant = x,
-                                                    ReminderType = EF.Functions.DateDiffDay(x.CreatedDate!.Value, DateTime.Now) == 3
-                                                                    ? Day3
-                                                                    : Week2
-                                                })
-                                                .ToListAsync();
+                var pendingGrants = new List<PendingGrants>();
+
+                if (_appSecrets.IsProduction)
+                {
+                    pendingGrants = await _context.PendingGrants
+                                                  .Where(x =>
+                                                      x.status == "pending" &&
+                                                      x.CreatedDate.HasValue &&
+                                                      (
+                                                        EF.Functions.DateDiffDay(x.CreatedDate.Value, DateTime.Now) == 3 ||
+                                                        EF.Functions.DateDiffDay(x.CreatedDate.Value, DateTime.Now) == 14)
+                                                      )
+                                                  .Include(x => x.User)
+                                                  .Include(x => x.Campaign)
+                                                  .ToListAsync();
+                }
+                else
+                {
+                    var emails = _appSecrets.EmailListForScheduler
+                                            .Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                            .Select(e => e.Trim().ToLower())
+                                            .ToList();
+
+                    pendingGrants = await _context.PendingGrants
+                                                  .Where(x =>
+                                                      x.status == "pending" &&
+                                                      x.CreatedDate.HasValue &&
+                                                      (
+                                                          EF.Functions.DateDiffDay(x.CreatedDate.Value, DateTime.Now) == 3 ||
+                                                          EF.Functions.DateDiffDay(x.CreatedDate.Value, DateTime.Now) == 14
+                                                      ) &&
+                                                      x.User.Email != null &&
+                                                      emails.Contains(x.User.Email.ToLower())
+                                                  )
+                                                  .Include(x => x.User)
+                                                  .Include(x => x.Campaign)
+                                                  .ToListAsync();
+                }
 
                 var allEmailTasks = new List<Task>();
+                var emailLogs = new List<ScheduledEmailLog>();
 
-                foreach (var item in pendingGrants)
+                foreach (var grant in pendingGrants)
                 {
-                    var grant = item.Grant;
-                    var reminderType = item.ReminderType;
+                    var daysDiff = (DateTime.Now.Date - grant.CreatedDate!.Value.Date).Days;
+                    string reminderType = daysDiff == 3 ? Day3 : Week2;
 
-                    ScheduledEmailLog? log = null;
+                    if (reminderType == Day3) day3Count++;
+                    if (reminderType == Week2) week2Count++;
 
-                    if (reminderType == Day3 || reminderType == Week2)
+                    var log = new ScheduledEmailLog
                     {
-                        log = new ScheduledEmailLog
-                        {
-                            PendingGrantId = grant.Id,
-                            UserId = grant.UserId,
-                            ReminderType = reminderType,
-                            SentDate = DateTime.Now
-                        };
-
-                        await _context.AddAsync(log);
-                        await _context.SaveChangesAsync();
-                    }
+                        PendingGrantId = grant.Id,
+                        UserId = grant.UserId,
+                        ReminderType = reminderType,
+                        SentDate = DateTime.Now
+                    };
+                    emailLogs.Add(log);
 
                     try
                     {
-                        if (reminderType == Day3)
-                        {
-                            day3Count++;
-                            allEmailTasks.Add(
-                                SendThreeDaysDAFEmail(
-                                    grant.User.Email!,
-                                    grant.User.FirstName!,
-                                    grant.DAFProvider,
-                                    Convert.ToDecimal(grant.Amount),
-                                    grant.Campaign?.Name ?? string.Empty));
-                        }
+                        var dafProvider = grant.DAFProvider?.Trim().ToLower();
 
-                        if (reminderType == Week2)
+                        if (!string.IsNullOrWhiteSpace(dafProvider) && dafProvider != "foundation grant")
                         {
-                            week2Count++;
+                            string? dafProviderLink = await GetDafLink(dafProvider!);
+
+                            await SendDAFEmail(
+                                reminderType,
+                                grant.User.Email!,
+                                grant.User.FirstName!,
+                                Convert.ToDecimal(grant.Amount),
+                                grant.DAFProvider?.Trim()!,
+                                grant.DAFName,
+                                dafProviderLink,
+                                grant.Campaign?.Name ?? string.Empty,
+                                grant.Campaign?.ContactInfoFullName ?? string.Empty,
+                                grant.Campaign?.Property ?? string.Empty);
+                        }
+                        else if (dafProvider == "foundation grant")
+                        {
                             allEmailTasks.Add(
-                                SendTwoWeeksDAFEmail(
-                                          grant.User.Email!,
-                                          grant.User.FirstName!,
-                                          grant.Campaign?.ContactInfoFullName ?? string.Empty,
-                                          grant.DAFProvider,
-                                          Convert.ToDecimal(grant.Amount),
-                                          grant.Campaign?.Name ?? string.Empty,
-                                          grant.Campaign?.Property ?? string.Empty));
+                                    SendFoundationEmail(
+                                        reminderType,
+                                        grant.User.Email!,
+                                        grant.User.FirstName!,
+                                        Convert.ToDecimal(grant.Amount),
+                                        grant.Campaign?.Name ?? string.Empty,
+                                        grant.Campaign?.ContactInfoFullName ?? string.Empty,
+                                        grant.Campaign?.Property ?? string.Empty));
                         }
                     }
                     catch (Exception ex)
                     {
-                        if (log != null)
-                        {
-                            log.ErrorMessage = ex.Message;
-                            _context.Update(log);
-                            await _context.SaveChangesAsync();
-                        }
+                        log.ErrorMessage = ex.Message;
                     }
                 }
+
+                await _context.AddRangeAsync(emailLogs);
+                await _context.SaveChangesAsync();
 
                 _ = Task.Run(async () =>
                 {
@@ -130,7 +147,7 @@ namespace Investment.Service.Services
             }
             catch (Exception ex)
             {
-                logEntry.ErrorMessage = ex.Message;
+                logEntry.ErrorMessage = ex.ToString();
             }
             finally
             {
@@ -143,96 +160,92 @@ namespace Investment.Service.Services
             }
         }
 
-        public async Task SendThreeDaysDAFEmail(string email, string firstName, string dafProviderName, decimal amount, string investmentName)
+        public async Task SendDAFEmail(
+            string reminderType,
+            string email,
+            string firstName,
+            decimal amount,
+            string dafProviderName,
+            string? dafName,
+            string? dafProviderLink,
+            string investmentName,
+            string investmentOwnerName,
+            string investmentSlug)
         {
-            string formattedAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", amount);
+            EmailTemplateCategory category;
 
-            string investmentScenarios = !string.IsNullOrEmpty(investmentName)
-                                            ? $"to <b>{investmentName}</b>"
-                                            : "";
+            if (dafProviderName == "ImpactAssets")
+            {
+                category = reminderType == Day3
+                    ? EmailTemplateCategory.DAFReminderImpactAssetsDay3
+                    : EmailTemplateCategory.DAFReminderImpactAssetsWeek2;
+            }
+            else
+            {
+                category = reminderType == Day3
+                    ? EmailTemplateCategory.DAFReminderDay3
+                    : EmailTemplateCategory.DAFReminderWeek2;
+            }
 
-            string? dafLink = await GetDafLink(dafProviderName);
+            string formattedAmount = string.Format(CultureInfo.GetCultureInfo("en-US"), "${0:N2}", amount);
 
-            var dafLinkScenarios = await GetDafLink(dafProviderName) != null
-                                            ? $@"<a href='{dafLink}' target='_blank'>{dafProviderName}</a>"
-                                            : dafProviderName;
+            var variables = new Dictionary<string, string>
+            {
+                { "firstName", firstName },
+                { "amount", formattedAmount },
+                { "investmentScenario", investmentName },
+                { "dafProviderName", dafProviderName },
+                { "dafProviderLink", dafProviderLink ?? "" },
+                { "dafName", dafName ?? dafProviderName },
+                { "investmentOwnerName", investmentOwnerName },
+                { "investmentUrl", $"{_appSecrets.RequestOrigin}/investments/{investmentSlug}" },
+                { "unsubscribeUrl", $"{_appSecrets.RequestOrigin}/settings" }
+            };
 
-            string subject = "⏳ A Quick Nudge – Your Grant Is Still Pending";
+            _emailQueue.QueueEmail(async (sp) =>
+            {
+                var emailService = sp.GetRequiredService<IEmailTemplateService>();
 
-            var body = @$"
-                        <p>Hi {firstName},</p>
-                        <p>Thanks again for your generous <b>{formattedAmount}</b> commitment {investmentScenarios} — we’re excited to help move your capital to work!</p>  
-                        <p>We noticed your donation is still marked as <b>pending</b>, so here’s a quick reminder on how to complete it:</p>
-                        <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>                             
-                        <p><div style='font-size: 20px;'><b>✅ How to Complete Your Grant</b></div></p>
-                        <ol>
-                            <li><b>Log in </b>to your {dafLinkScenarios} account</li>
-                            <li><b>Initiate a grant </b>using the details below:</li>
-                            <ul style='list-style-type:disc;'>
-                                <li><b>Donation Recipient:</b> Donation Recipient</li>
-                                <li><b>Amount:</b> {formattedAmount}</li>
-                                <li><b>EIN:</b> 12-3456789</li>
-                                <li><b>Email:</b> Email</li>
-                                <li><b>Address:</b> Address</li>
-                            </ul>
-                            <li><b>Forward your grant confirmation</b> to <b>Email</b> so we can apply your investment without delay.</li>
-                        </ol>
-                        <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>
-                        <p>We’re honored to work alongside you to fuel the future. Let’s unlock your impact — together. 💥</p>
-                        <p style='margin-top: 0px;'><a href='{baseUrl}/settings' target='_blank'>Unsubscribe from notifications</a></p>
-                        ";
-
-            await _mailService.SendMailAsync(email, subject, "", body);
+                await emailService.SendTemplateEmailAsync(
+                    category,
+                    email,
+                    variables
+                );
+            });
         }
 
-        public async Task SendTwoWeeksDAFEmail(string email, string firstName, string investmentOwnerName, string dafProviderName, decimal amount, string investmentName, string investmentSlug)
+        public async Task SendFoundationEmail(string reminderType, string email, string firstName, decimal amount, string investmentName, string investmentOwnerName, string investmentSlug)
         {
-            string formattedAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", amount);
+            string formattedAmount = string.Format(CultureInfo.GetCultureInfo("en-US"), "${0:N2}", amount);
 
-            string investmentScenarios = !string.IsNullOrEmpty(investmentName)
-                                            ? $"in <b>{investmentName}</b>"
-                                            : "";
+            string investmentScenario = !string.IsNullOrEmpty(investmentName)
+                                        ? $"to <b>{investmentName}</b>"
+                                        : "to Investment";
 
-            string investmentURL = $"{baseUrl}/invest/{investmentSlug}";
+            var variables = new Dictionary<string, string>
+            {
+                { "firstName", firstName },
+                { "amount", formattedAmount },
+                { "investmentScenario", investmentScenario },
+                { "investmentOwnerName", investmentOwnerName },
+                { "investmentUrl", $"{_appSecrets.RequestOrigin}/investments/{investmentSlug}" },
+                { "unsubscribeUrl", $"{_appSecrets.RequestOrigin}/settings" }
+            };
 
-            string investmentFooterScenarios = !string.IsNullOrEmpty(investmentName)
-                             ? @$"<p style='margin-bottom: 0px; margin-top: 0px;'><b>{investmentOwnerName}</b></p>
-                                  <p style='margin-bottom: 0px; margin-top: 0px;'><a href='{investmentURL}' target='_blank'>{investmentURL}</a></p>"
-                             : "";
+            EmailTemplateCategory category = reminderType == Day3
+                                                ? EmailTemplateCategory.FoundationReminderDay3
+                                                : EmailTemplateCategory.FoundationReminderWeek2;
 
-            string? dafLink = await GetDafLink(dafProviderName);
+            _emailQueue.QueueEmail(async (sp) =>
+            {
+                var emailService = sp.GetRequiredService<IEmailTemplateService>();
 
-            var dafLinkScenarios = await GetDafLink(dafProviderName) != null
-                                                ? $@"<a href='{dafLink}' target='_blank'>{dafProviderName}</a>"
-                                                : dafProviderName;
-
-            string subject = "⏳ Still Pending – Help Us Activate Your Donation-to-Invest";
-
-            var body = @$"
-                        <p>Hi {firstName},</p>
-                        <p>We’re honored by your commitment to invest <b>{formattedAmount}</b> {investmentScenarios} — thank you for being part of this movement.</p>  
-                        <p>Your <b>donation to invest</b> is still marked as <b>pending</b>, so here’s a quick reminder on how to complete it:</p>
-                        <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>                             
-                        <p><div style='font-size: 20px;'><b>✅ How to Complete Your Donation</b></div></p>
-                        <ol>
-                            <li><b>Log in </b>to your {dafLinkScenarios} account</li>
-                            <li><b>Initiate a donation </b>using the following details:</li>
-                            <ul style='list-style-type:disc;'>
-                                <li><b>Donation Recipient:</b> Donation Recipient</li>
-                                <li><b>Amount:</b> {formattedAmount}</li>
-                                <li><b>EIN:</b> 12-3456789</li>
-                                <li><b>Email:</b> Email</li>
-                                <li><b>Address:</b> Address</li>
-                            </ul>
-                            <li><b>Forward the confirmation email</b> to <b>Email</b> so we can apply your investment right away.</li>
-                        </ol>
-                        <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>
-                        <p style='margin-bottom: 0px; margin-top: 0px;'>With gratitude,</p>
-                        {investmentFooterScenarios}
-                        <p style='margin-top: 0px;'><a href='{baseUrl}/settings' target='_blank'>Unsubscribe from notifications</a></p>
-                        ";
-
-            await _mailService.SendMailAsync(email, subject, "", body);
+                await emailService.SendTemplateEmailAsync(
+                    category,
+                    email,
+                    variables
+                );
+            });
         }
 
         public async Task<string?> GetDafLink(string providerName)

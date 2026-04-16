@@ -13,5 +13,8 @@
         public string InvestmentId { get; set; } = string.Empty;
         public decimal InvestedSum { get; set; }
         public string? Reference { get; set; }
+        public AddressDto? Address { get; set; }
+        public decimal InvestmentAmountWithFees { get; set; }
+        public bool CoverFees { get; set; }
     }
 }

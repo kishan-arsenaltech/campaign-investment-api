@@ -1,6 +1,6 @@
 ﻿namespace Investment.Core.Entities
 {
-    public class ReturnDetails
+    public class ReturnDetails : BaseEntity
     {
         public int Id { get; set; }
         public int ReturnMasterId { get; set; }

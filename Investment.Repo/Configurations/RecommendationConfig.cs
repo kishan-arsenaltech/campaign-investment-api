@@ -13,6 +13,7 @@ namespace Investment.Repo.Configurations
             builder.HasOne(r => r.PendingGrants).WithMany().HasForeignKey(r => r.PendingGrantsId);
             builder.HasOne(r => r.User).WithMany().HasForeignKey(r => r.UserId);
             builder.HasOne(x => x.RejectedByUser).WithMany().HasForeignKey(x => x.RejectedBy);
+            builder.HasOne(x => x.DeletedByUser).WithMany().HasForeignKey(x => x.DeletedBy);
         }
     }
 }

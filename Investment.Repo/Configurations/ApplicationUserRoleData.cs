@@ -14,6 +14,7 @@ namespace Investment.Repo.Configurations
                    UserId = "ccc24a6d-aa14-4f0e-ac7f-09740cb196f8",
                    RoleId = "460da70e-6557-4584-8fe2-03524ea7f5dc"
                });
+            builder.HasOne(x => x.DeletedByUser).WithMany().HasForeignKey(x => x.DeletedBy);
         }
     }
 }

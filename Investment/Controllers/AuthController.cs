@@ -2,14 +2,20 @@
 
 using AutoMapper;
 using Invest.Core.Dtos;
+using Invest.Core.Models;
+using Invest.Core.Settings;
+using Investment.Core.Constants;
 using Investment.Core.Dtos;
 using Investment.Core.Entities;
 using Investment.Extensions;
 using Investment.Repo.Context;
 using Investment.Service.Filters.ActionFilters;
 using Investment.Service.Interfaces;
+using Investment.Service.Services;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
 using System.Text;
 using System.Text.Json;
 
@@ -20,85 +26,27 @@ namespace Invest.Controllers;
 [ApiController]
 public class AuthController : BaseApiController
 {
-    private readonly IMailService _mailService;
     private readonly RepositoryContext _context;
-    private readonly KeyVaultConfigService _keyVaultConfigService;
+    private readonly AppSecrets _appSecrets;
     private readonly HttpClient _httpClient;
-    private readonly IWebHostEnvironment _environment;
+    private readonly RoleManager<ApplicationRole> _roleManager;
+    private readonly UserManager<User> _userManager;
+    private readonly EmailQueue _emailQueue;
 
-    public AuthController(RepositoryContext context, IRepositoryManager repository, ILoggerManager logger, IMapper mapper, IMailService mailService, KeyVaultConfigService keyVaultConfigService, HttpClient httpClient, IWebHostEnvironment environment) : base(repository, logger, mapper)
+    public AuthController(RepositoryContext context, IRepositoryManager repository, ILoggerManager logger, IMapper mapper, AppSecrets appSecrets, HttpClient httpClient, RoleManager<ApplicationRole> roleManager, UserManager<User> userManager, EmailQueue emailQueue) : base(repository, logger, mapper)
     {
-        _mailService = mailService;
         _context = context;
-        _keyVaultConfigService = keyVaultConfigService;
+        _appSecrets = appSecrets;
         _httpClient = httpClient;
-        _environment = environment;
-    }
-
-    private async Task AddUserToKlaviyo(User user)
-    {
-        string klaviyoApiKey = _keyVaultConfigService.GetKlaviyoApiKey();
-        string klaviyoListKey = _keyVaultConfigService.GetKlaviyoListKey();
-
-        _httpClient.DefaultRequestHeaders.Clear();
-        _httpClient.DefaultRequestHeaders.Add("Authorization", $"Klaviyo-API-Key {klaviyoApiKey}");
-        _httpClient.DefaultRequestHeaders.Add("revision", "2024-05-15");
-
-        var payload = new
-        {
-            data = new
-            {
-                type = "profile",
-                attributes = new
-                {
-                    email = user.Email,
-                    first_name = user.FirstName,
-                    last_name = user.LastName,
-                    properties = new
-                    {
-                        isFreeUser = user.IsFreeUser,
-                        name = user.FirstName + " " + user.LastName
-                    }
-                }
-            }
-        };
-
-        var json = JsonSerializer.Serialize(payload);
-        var content = new StringContent(json, Encoding.UTF8, "application/json");
-        var response = await _httpClient.PostAsync("https://a.klaviyo.com/api/profiles/", content);
-        var responseContent = await response.Content.ReadAsStringAsync();
-
-        if (response.IsSuccessStatusCode)
-        {
-            using var doc = JsonDocument.Parse(responseContent);
-            var profileId = doc.RootElement.GetProperty("data").GetProperty("id").GetString();
-
-            user.KlaviyoProfileId = profileId;
-
-            var listPayload = new
-            {
-                data = new[]
-                {
-                    new
-                    {
-                        type = "profile",
-                        id = profileId
-                    }
-                }
-            };
-            var listJson = JsonSerializer.Serialize(listPayload);
-            var listContent = new StringContent(listJson, Encoding.UTF8, "application/json");
-            string url = $"https://a.klaviyo.com/api/lists/{klaviyoListKey}/relationships/profiles/";
-
-            await _httpClient.PostAsync(url, listContent);
-        }
-        await _repository.SaveAsync();
+        _roleManager = roleManager;
+        _userManager = userManager;
+        _emailQueue = emailQueue;
     }
 
     [AllowAnonymous]
     [HttpPost("register")]
     [ServiceFilter(typeof(ValidationFilterAttribute))]
-    public async Task<IActionResult> RegisterUser([FromBody] UserRegistrationDto userRegistration, bool sendEmail = true, bool activate = true)
+    public async Task<IActionResult> RegisterUser([FromBody] UserRegistrationDto userRegistration)
     {
         if (!string.IsNullOrEmpty(userRegistration.CaptchaToken))
         {
@@ -106,7 +54,6 @@ public class AuthController : BaseApiController
                 return BadRequest("CAPTCHA verification failed.");
         }
 
-        var allEmailTasks = new List<Task>();
         var requestOrigin = HttpContext?.Request.Headers["Origin"].ToString();
 
         var userResult = await _repository.UserAuthentication.RegisterUserAsync(userRegistration, UserRoles.User);
@@ -151,89 +98,64 @@ public class AuthController : BaseApiController
             }
         }
 
-        var user = _context.Users.Where(x => x.Email == userRegistration.Email).FirstOrDefault();
-        user!.IsActive = activate;
+        var user = await _context.Users.Where(x => x.Email == userRegistration.Email).FirstOrDefaultAsync();
+        user!.IsActive = true;
         user.IsFreeUser = true;
         await _repository.UserAuthentication.UpdateUser(user);
-
-        if (_environment.EnvironmentName == "Production")
-            await AddUserToKlaviyo(user);
 
         UserLoginDto userLoginDto = new();
         userLoginDto.Email = userRegistration.Email;
         userLoginDto.Password = userRegistration.Password;
         await _repository.UserAuthentication.ValidateUserAsync(userLoginDto);
 
-        _ = Task.Run(async () =>
+        var variables = new Dictionary<string, string>
         {
-            string subject = "Welcome - Let’s Move Capital That Matters 💥";
+            { "firstName", userRegistration.FirstName! },
+            { "userName", userRegistration.UserName! },
+            { "resetPasswordUrl", $"{_appSecrets.RequestOrigin}/forgotpassword" },
+            { "siteUrl", _appSecrets.RequestOrigin }
+        };
 
-            if (sendEmail)
-            {
-                var body = $@"
-                            <html>
-                                <body>
-                                    <p><b>Hi {userRegistration.FirstName},</b></p>
-                                    <p>Welcome to - the movement turning philanthropic dollars into <b>powerful, catalytic investments</b> that fuel real change.</p>
-                                    <p>You’ve just joined what we believe will become the <b>largest community of catalytic capital champions</b> on the planet. Whether you're a donor, funder, or impact-curious investor - you're in the right place.</p>
-                                    <p>Here’s what you can do right now:</p>
-                                    <p>🔎 <b>1. Discover Investments Aligned with Your Values</b></p>
-                                    <p style='margin-bottom: 0px;'>Use your <b>DAF, foundation, or donation capital</b> to fund vetted companies, VC funds, and loan structures — not just nonprofits.</p>
-                                    <p style='margin-top: 0px;'>➡️ <a href='{requestOrigin}/find'>Browse live investment opportunities</a></p>
-                                    <p>🤝 <b>2. Connect with Like-Minded Peers</b></p>
-                                    <p style='margin-bottom: 0px;'>Follow friends and colleagues, share opportunities, or keep your giving private — you’re in control.</p>
-                                    <p>🗣️ <b>3. Join or Start a Group</b></p>
-                                    <p style='margin-bottom: 0px;'>Find (or create!) groups around shared causes and funding themes — amplify what matters to you.</p>
-                                    <p style='margin-top: 0px;'>➡️ <a href='{requestOrigin}/community'>See active groups and start your own</a></p>
-                                    <p>🚀 <b>4. Recommend Deals You Believe In</b></p>
-                                    <p style='margin-bottom: 0px;'>Champion investments that should be seen — and funded — by others in the community.</p>
-                                    <p>We’re here to help you put your capital to work — boldly, effectively, and in community.</p>
-                                    <p>Thanks for joining us. Let’s fund what we wish existed — together.</p>
-                                    <p><a href='{requestOrigin}/settings' target='_blank'>Unsubscribe</a> from notifications.</p>
-                                </body>
-                            </html>";
+        _emailQueue.QueueEmail(async (sp) =>
+        {
+            var emailService = sp.GetRequiredService<IEmailTemplateService>();
 
-                allEmailTasks.Add(_mailService.SendMailAsync(user.Email, subject, "", body));
-
-                if (userRegistration.IsAnonymous)
-                {
-                    string resetPasswordUrl = $"{requestOrigin}/forgotpassword";
-                    string userSettingsUrl = $"{requestOrigin}/settings";
-
-                    var template = $@"
-                                    <html>
-                                        <body>
-                                            <p><b>Hi {userRegistration.FirstName},</b></p>
-                                            <p>Welcome to - the movement turning philanthropic dollars into <b>powerful, catalytic investments</b> that fuel real change.</p>
-                                            <p>You’ve just joined what we believe will become the <b>largest community of catalytic capital champions</b> on the planet. Whether you're a donor, funder, or impact-curious investor - you're in the right place.</p>
-                                            <p>Your username: <b>{userRegistration.UserName}</b></p>
-                                            <p>To set your password: <a href='{resetPasswordUrl}' target='_blank'>Click here</a></p>
-                                            <p>Here’s what you can do right now:</p>
-                                            <p>🔎 <b>1. Discover Investments Aligned with Your Values</b></p>
-                                            <p style='margin-bottom: 0px;'>Use your <b>DAF, foundation, or donation capital</b> to fund vetted companies, VC funds, and loan structures — not just nonprofits.</p>
-                                            <p style='margin-top: 0px;'>➡️ <a href='{requestOrigin}/find'>Browse live investment opportunities</a></p>
-                                            <p>🤝 <b>2. Connect with Like-Minded Peers</b></p>
-                                            <p style='margin-bottom: 0px;'>Follow friends and colleagues, share opportunities, or keep your giving private — you’re in control.</p>
-                                            <p style='margin-top: 0px;'>➡️ <a href='{requestOrigin}/community'>Explore the community</a></p>
-                                            <p>🗣️ <b>3. Join or Start a Group</b></p>
-                                            <p style='margin-bottom: 0px;'>Find (or create!) groups around shared causes and funding themes — amplify what matters to you.</p>
-                                            <p style='margin-top: 0px;'>➡️ <a href='{requestOrigin}/community'>See active groups and start your own</a></p>
-                                            <p>🚀 <b>4. Recommend Deals You Believe In</b></p>
-                                            <p style='margin-bottom: 0px;'>Champion investments that should be seen — and funded — by others in the community.</p>
-                                            <p>We’re here to help you put your capital to work — boldly, effectively, and in community.</p>
-                                            <p>Thanks for joining us. Let’s fund what we wish existed — together.</p>
-                                            <p><a href='{requestOrigin}/settings' target='_blank'>Unsubscribe</a> from notifications.</p>
-                                        </body>
-                                    </html>";
-
-                    allEmailTasks.Add(_mailService.SendMailAsync(user.Email, subject, "", template));
-                }
-            }
-
-            await Task.WhenAll(allEmailTasks);
+            await emailService.SendTemplateEmailAsync(
+                userRegistration.IsAnonymous
+                    ? EmailTemplateCategory.WelcomeAnonymousUser
+                    : EmailTemplateCategory.WelcomeRegisteredUser,
+                user.Email,
+                variables
+            );
         });
 
         return Ok(new { success = true, data = await _repository.UserAuthentication.CreateTokenAsync() });
+    }
+
+    [HttpPost("admin/login")]
+    [ServiceFilter(typeof(ValidationFilterAttribute))]
+    public async Task<IActionResult> AdminAuthenticate([FromBody] UserLoginDto user)
+    {
+        var isValid = await _repository.UserAuthentication.ValidateUserAsync(user);
+
+        if (!isValid)
+            return Unauthorized();
+
+        var dbUser = await _context.Users.FirstOrDefaultAsync(x => x.Email.ToLower() == user.Email || x.UserName.ToLower() == user.Email);
+
+        if (dbUser == null)
+            return Unauthorized();
+
+        var roles = await _userManager.GetRolesAsync(dbUser);
+
+        if (roles.Contains(UserRoles.Admin) || roles.Contains(UserRoles.SuperAdmin))
+        {
+            await _repository.UserAuthentication.SendAdminCode(dbUser.Email);
+
+            return Ok(new { requires2FA = false, email = dbUser.Email });
+        }
+
+        return Unauthorized();
     }
 
     [HttpPost("login")]
@@ -247,11 +169,9 @@ public class AuthController : BaseApiController
 
     public async Task<bool> VerifyCaptcha(string token)
     {
-        string captchaSecretKey = _keyVaultConfigService.GetCaptchaSecretKey();
-
         var requestContent = new FormUrlEncodedContent(new[]
         {
-            new KeyValuePair<string, string>("secret", captchaSecretKey),
+            new KeyValuePair<string, string>("secret", _appSecrets.CaptchaSecretKey),
             new KeyValuePair<string, string>("response", token)
         });
 
@@ -276,8 +196,11 @@ public class AuthController : BaseApiController
     [ServiceFilter(typeof(ValidationFilterAttribute))]
     public async Task<IActionResult> SendCode([FromBody] EmailReceiveDto email)
     {
-        if (!await VerifyCaptcha(email.CaptchaToken!))
-            return BadRequest("CAPTCHA verification failed.");
+        if (!string.IsNullOrWhiteSpace(email.CaptchaToken))
+        {
+            if (!await VerifyCaptcha(email.CaptchaToken))
+                return BadRequest("CAPTCHA verification failed.");
+        }
 
         if (string.IsNullOrEmpty(email.Email))
             return BadRequest();
@@ -292,6 +215,25 @@ public class AuthController : BaseApiController
         var res = _repository.UserAuthentication.CheckCode(resetCode.Email, resetCode.Code);
         IActionResult result = res ? StatusCode(200) : new NotFoundResult();
         return Task.FromResult(result);
+    }
+
+    [HttpPost("verify-2fa")]
+    [ServiceFilter(typeof(ValidationFilterAttribute))]
+    public async Task<IActionResult> Verify2FA([FromBody] ResetCodeDto resetCode)
+    {
+        var user = await _repository.UserAuthentication.GetUserByEmail(resetCode.Email);
+
+        if (user == null)
+            return Ok(new { success = false, Message = "Verification code is incorrect or has expired. Please request a new code and try again." });
+
+        var isValid = _repository.UserAuthentication.CheckCode(resetCode.Email, resetCode.Code);
+
+        if (!isValid)
+            return Ok(new { success = false, Message = "Verification code is incorrect or has expired. Please request a new code and try again." });
+
+        var token = await _repository.UserAuthentication.CreateTokenAsync(user);
+
+        return Ok(new { token });
     }
 
     [HttpPost("login-admin-to-user")]

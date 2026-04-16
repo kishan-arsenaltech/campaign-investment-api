@@ -11,5 +11,7 @@
         public int? InvestmentId { get; set; }
         public bool? FilterByGroup { get; set; }
         public string? Stages { get; set; }
+        public bool? InvestmentStatus { get; set; }
+        public bool? IsDeleted { get; set; }
     }
 }

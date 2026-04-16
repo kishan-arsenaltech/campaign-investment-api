@@ -2,7 +2,7 @@
 
 namespace Investment.Core.Entities
 {
-    public class Recommendation
+    public class Recommendation : BaseEntity
     {
         public int Id { get; set; }
         public string? UserId { get; set; }

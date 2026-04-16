@@ -1,5 +1,6 @@
 ﻿// Ignore Spelling: Middleware Middlewares Api
 
+using Invest.Core.Settings;
 using Investment.Extensions;
 
 namespace Invest.Middlewares
@@ -7,19 +8,18 @@ namespace Invest.Middlewares
     public class ApiAccessTokenMiddleware
     {
         private readonly RequestDelegate _next;
-        private readonly KeyVaultConfigService _keyVaultConfigService;
+        private readonly AppSecrets _appSecrets;
 
-        public ApiAccessTokenMiddleware(RequestDelegate next, KeyVaultConfigService keyVaultConfigService)
+        public ApiAccessTokenMiddleware(RequestDelegate next, AppSecrets appSecrets)
         {
             _next = next;
-            _keyVaultConfigService = keyVaultConfigService;
+            _appSecrets = appSecrets;
         }
 
         public async Task InvokeAsync(HttpContext context)
         {
-            string apiAccessToken = _keyVaultConfigService.GetApiAccessToken();
-
-            if (context.Request.Path.StartsWithSegments("/api/Payment/stripe-webhook", StringComparison.OrdinalIgnoreCase))
+            if (_appSecrets.IsDevelopment
+                || context.Request.Path.StartsWithSegments("/api/Payment/stripe-webhook", StringComparison.OrdinalIgnoreCase))
             {
                 await _next(context);
                 return;
@@ -27,10 +27,8 @@ namespace Invest.Middlewares
 
             if (context.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase))
             {
-                if (!context.Request.Headers.TryGetValue("api-access-token", out var token) || token != apiAccessToken)
-                {
+                if (!context.Request.Headers.TryGetValue("api-access-token", out var token) || token != _appSecrets.ApiAccessToken)
                     return;
-                }
             }
 
             await _next(context);

@@ -3,18 +3,18 @@ using Quartz;
 
 namespace Investment.Service.Jobs
 {
-    public class SendDAFReminderEmail : IJob
+    public class SendReminderEmail : IJob
     {
         private readonly IEmailJobService _emailJobService;
 
-        public SendDAFReminderEmail(IEmailJobService emailJobService)
+        public SendReminderEmail(IEmailJobService emailJobService)
         {
             _emailJobService = emailJobService;
         }
 
         public async Task Execute(IJobExecutionContext context)
         {
-            await _emailJobService.SendDafReminderEmailsAsync();
+            await _emailJobService.SendReminderEmailsAsync(context.JobDetail.Key.Name);
         }
     }
 }

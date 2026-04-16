@@ -4,23 +4,33 @@ using System.ComponentModel.DataAnnotations.Schema;
 
 namespace Investment.Core.Entities
 {
-    public class User : IdentityUser
+    public class User : IdentityUser, IBaseEntity
     {
         public string? FirstName { get; set; }
         public string? LastName { get; set; }
         public decimal? AccountBalance { get; set; }
-        public string? Address { get; set; }
         public string? PictureFileName { get; set; }
-        public bool IsApprouveRequired { get; set; } = false;
-        public bool IsUserHidden { get; set; } = false;
-        public bool EmailFromGroupsOn { get; set; } = false;
-        public bool EmailFromUsersOn { get; set; } = false;
-        public bool OptOutEmailNotifications { get; set; } = false;
-        public bool IsActive { get; set; } = false;
-        public bool IsFreeUser { get; set; } = false;
-        public bool IsAnonymousInvestment { get; set; } = false;
-        public string? KlaviyoProfileId { get; set; }
-        public DateTime DateCreated { get; set; } = DateTime.Now;
+        public string? Address { get; set; }
+        public bool? IsApprouveRequired { get; set; } = false;
+        public bool? IsUserHidden { get; set; } = false;
+        public bool? EmailFromGroupsOn { get; set; } = false;
+        public bool? EmailFromUsersOn { get; set; } = false;
+        public bool? OptOutEmailNotifications { get; set; } = false;
+        public bool? IsActive { get; set; } = false;
+        public DateTime? DateCreated { get; set; }
+        public bool? IsFreeUser { get; set; } = false;
+        public bool? IsAnonymousInvestment { get; set; }
+        public bool ConsentToShowAvatar { get; set; } = true;
+        public bool IsExcludeUserBalance { get; set; } = false;
+        public string? AlternateEmail { get; set; }
+        public string? ZipCode { get; set; }
+
+        public bool IsDeleted { get; set; } = false;
+        public string? DeletedBy { get; set; }
+        public User? DeletedByUser { get; set; }
+
+        [Column(TypeName = "datetime")]
+        public DateTime? DeletedAt { get; set; }
 
         public ICollection<Group>? Groups { get; set; }
         public ICollection<FollowingRequest>? Requests { get; set; }

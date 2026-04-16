@@ -15,5 +15,6 @@ namespace Investment.Core.Entities
         public int Day3EmailCount { get; set; }
         public int Week2EmailCount { get; set; }
         public string? ErrorMessage { get; set; }
+        public string? JobName { get; set; }
     }
 }

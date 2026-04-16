@@ -1,6 +1,6 @@
 ﻿namespace Investment.Core.Entities
 {
-    public class UsersNotification
+    public class UsersNotification : BaseEntity
     {
         public int Id { get; set; }
         public string Title { get; set; } = string.Empty;
