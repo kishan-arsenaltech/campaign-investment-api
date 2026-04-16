@@ -5,6 +5,7 @@
         public const string SqlConnection = "sql-connection";
 
         public const string BlobConfiguration = "blob-configuration";
+        public const string StorageSecretKey = "storage-secret-key";
 
         public const string JwtIssuer = "Jwt-Config-Name";
         public const string JwtSecret = "Jwt-secret";

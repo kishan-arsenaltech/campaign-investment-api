@@ -11,6 +11,7 @@
         public string SqlConnection { get; set; } = default!;
 
         public string BlobConfiguration { get; set; } = default!;
+        public string StorageSecretKey { get; set; } = default!;
 
         public string JwtIssuer { get; set; } = default!;
         public string JwtSecret { get; set; } = default!;

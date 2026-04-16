@@ -28,6 +28,7 @@ namespace Investment.Extensions
             {
                 Env(SecretKeys.SqlConnection),
                 Env(SecretKeys.BlobConfiguration),
+                Env(SecretKeys.StorageSecretKey),
                 Env(SecretKeys.JwtIssuer),
                 Env(SecretKeys.JwtSecret),
                 Env(SecretKeys.JwtExpiresIn),

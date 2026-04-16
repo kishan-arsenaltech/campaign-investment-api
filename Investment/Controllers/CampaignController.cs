@@ -1131,8 +1131,7 @@ namespace Invest.Controllers
 
                     sasBuilder.ContentDisposition = $"attachment; filename=\"{downloadFileName}\"";
 
-                    //var sasToken = sasBuilder.ToSasQueryParameters(new StorageSharedKeyCredential(blobClient.AccountName, "storage-secret-key")).ToString();
-                    var sasToken = "";
+                    var sasToken = sasBuilder.ToSasQueryParameters(new StorageSharedKeyCredential(blobClient.AccountName, _appSecrets.StorageSecretKey)).ToString();
 
                     var uriBuilder = new UriBuilder(blobClient.Uri)
                     {

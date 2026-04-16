@@ -246,6 +246,7 @@ namespace Investment.Extensions
                     DefaultPassword = "SEcurE!Pa$$w0rd_#2025",
                     SqlConnection = config[SecretKeys.SqlConnection],
                     BlobConfiguration = config[SecretKeys.BlobConfiguration],
+                    StorageSecretKey = config[SecretKeys.StorageSecretKey],
                     JwtIssuer = config[SecretKeys.JwtIssuer],
                     JwtSecret = config[SecretKeys.JwtSecret],
                     JwtExpiresIn = int.Parse(config[SecretKeys.JwtExpiresIn]),
