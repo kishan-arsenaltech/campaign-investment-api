@@ -118,7 +118,7 @@ Configure `appsettings.Development.json` or `.env` with:
 ### Run Locally
 
 #### clone
-git clone https://github.com/your-org/campaign-investment-api.git
+git clone https://github.com/kishan-arsenaltech/campaign-investment-api.git
 cd campaign-investment-api
 
 #### restore dependencies
