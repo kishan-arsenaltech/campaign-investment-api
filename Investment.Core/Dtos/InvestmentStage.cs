@@ -19,9 +19,12 @@ namespace Investment.Core.Dtos
         [Description("Compliance Review")]
         ComplianceReview = 6,
 
-        [Description("Ongoing, Completed")]
-        OngoingCompleted = 7,
+        [Description("Completed - Ongoing")]
+        CompletedOngoing = 7,
 
-        Vetting = 8
+        Vetting = 8,
+
+        [Description("Completed - Ongoing/Private ")]
+        CompletedOngoingPrivate = 9,
     }
 }

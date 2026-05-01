@@ -11,6 +11,7 @@ namespace Investment.Repo.Configurations
             builder.HasOne(i => i.RequestOwner).WithMany(i => i.Requests);
             builder.HasOne(i => i.UserToFollow).WithMany(i => i.RequestsToAccept);
             builder.HasOne(i => i.GroupToFollow).WithMany(i => i.Requests);
+            builder.HasOne(x => x.DeletedByUser).WithMany().HasForeignKey(x => x.DeletedBy);
         }
     }
 }

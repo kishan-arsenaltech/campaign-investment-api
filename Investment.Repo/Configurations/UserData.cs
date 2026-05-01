@@ -22,6 +22,7 @@ namespace Investment.Repo.Configurations
                    ConcurrencyStamp = "bde4dffa-8ac6-42c9-82e9-d2eawer47a",
                    LockoutEnabled = true
                });
+            builder.HasOne(x => x.DeletedByUser).WithMany().HasForeignKey(x => x.DeletedBy);
         }
     }
 }

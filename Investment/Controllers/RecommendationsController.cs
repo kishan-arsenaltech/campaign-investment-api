@@ -1,11 +1,18 @@
 ﻿using AutoMapper;
 using ClosedXML.Excel;
+using Invest.Authorization.Enums;
 using Invest.Core.Dtos;
 using Invest.Core.Entities;
+using Invest.Core.Settings;
+using Investment.Authorization.Attributes;
+using Investment.Authorization.Enums;
+using Investment.Core.Constants;
 using Investment.Core.Dtos;
 using Investment.Core.Entities;
+using Investment.Core.Extensions;
 using Investment.Repo.Context;
 using Investment.Service.Interfaces;
+using Investment.Service.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -15,64 +22,70 @@ namespace Investment.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
+    [Module(Modules.Recommendations)]
     public class RecommendationsController : ControllerBase
     {
         private readonly RepositoryContext _context;
         protected readonly IRepositoryManager _repository;
         private readonly IMapper _mapper;
-        private readonly IMailService _mailService;
         private readonly IHttpContextAccessor _httpContextAccessor;
+        private readonly EmailQueue _emailQueue;
+        private readonly AppSecrets _appSecrets;
 
-        public RecommendationsController(RepositoryContext context, IRepositoryManager repositoryManager, IMapper mapper, IMailService mailService, IHttpContextAccessor httpContextAccessors)
+        public RecommendationsController(RepositoryContext context, IRepositoryManager repositoryManager, IMapper mapper, IHttpContextAccessor httpContextAccessors, EmailQueue emailQueue, AppSecrets appSecrets)
         {
             _context = context;
             _repository = repositoryManager;
             _mapper = mapper;
-            _mailService = mailService;
             _httpContextAccessor = httpContextAccessors;
+            _emailQueue = emailQueue;
+            _appSecrets = appSecrets;
         }
 
-        [HttpPost("get-recommendations")]
-        [Authorize(Roles = "Admin")]
-        public async Task<IActionResult> GetAllRecommendations([FromBody] PaginationDto pagination)
+        [HttpGet]
+        [ModuleAuthorize(PermissionType.View)]
+        public async Task<IActionResult> Get([FromQuery] PaginationDto pagination)
         {
             bool isAsc = pagination?.SortDirection?.ToLower() == "asc";
+            bool? isDeleted = pagination?.IsDeleted;
 
             var statusList = pagination?.Status?.Split(',', StringSplitOptions.RemoveEmptyEntries).Select(s => s.Trim().ToLower()).ToList();
 
+            var usersQuery = _context.Users
+                                     .Join(_context.UserRoles,
+                                         u => u.Id,
+                                         ur => ur.UserId,
+                                         (u, ur) => new { u, ur })
+                                     .Join(_context.Roles,
+                                         x => x.ur.RoleId,
+                                         r => r.Id,
+                                         (x, r) => new { x.u, r })
+                                     .Where(x => x.r.Name == UserRoles.User)
+                                     .Select(x => x.u);
+
             var query = _context.Recommendations
+                                .ApplySoftDeleteFilter(isDeleted)
+                                .Join(usersQuery,
+                                    r => r.UserEmail,
+                                    u => u.Email,
+                                    (r, u) => r)
                                 .Include(r => r.Campaign)
                                 .Include(r => r.RejectedByUser)
-                                .Select(r => new
-                                {
-                                    Id = r.Id,
-                                    UserEmail = r.UserEmail,
-                                    UserFullName = r.UserFullName,
-                                    Status = r.Status,
-                                    Amount = r.Amount,
-                                    CampaignId = r.Campaign!.Id,
-                                    CampaignName = r.Campaign.Name,
-                                    RejectionMemo = r.RejectionMemo!,
-                                    RejectedBy = r.RejectedByUser!.FirstName,
-                                    DateCreated = r.DateCreated
-                                })
                                 .AsQueryable();
 
             if (pagination?.InvestmentId != null)
-            {
                 query = query.Where(x => x.CampaignId == pagination.InvestmentId);
-            }
+
             if (statusList != null && statusList.Count > 0)
-            {
                 query = query.Where(x => !string.IsNullOrEmpty(x.Status) && statusList.Contains(x.Status.ToLower()));
-            }
 
             var orderedQuery = pagination?.SortField?.ToLower() switch
             {
                 "id" => isAsc ? query.OrderBy(r => r.Id) : query.OrderByDescending(r => r.Id),
                 "userfullname" => isAsc ? query.OrderBy(r => r.UserFullName) : query.OrderByDescending(r => r.UserFullName),
                 "status" => isAsc ? query.OrderBy(r => r.Status) : query.OrderByDescending(r => r.Status),
-                "campaignname" => isAsc ? query.OrderBy(r => r.CampaignName) : query.OrderByDescending(r => r.CampaignName),
+                "campaignname" => isAsc ? query.OrderBy(r => r.Campaign!.Name) : query.OrderByDescending(r => r.Campaign!.Name),
+                "amount" => isAsc ? query.OrderBy(r => r.Amount) : query.OrderByDescending(r => r.Amount),
                 "datecreated" => isAsc ? query.OrderBy(r => r.DateCreated) : query.OrderByDescending(r => r.DateCreated),
                 _ => query.OrderByDescending(r => r.DateCreated)
             };
@@ -84,20 +97,54 @@ namespace Investment.Controllers
 
             int totalCount = await query.CountAsync();
 
-            var pagedData = await finalQuery.Skip((page - 1) * pageSize).Take(pageSize).ToListAsync();
+            var pagedData = await finalQuery
+                                 .Skip((page - 1) * pageSize)
+                                 .Take(pageSize)
+                                 .Select(r => new
+                                 {
+                                     r.Id,
+                                     r.UserEmail,
+                                     r.UserFullName,
+                                     r.Status,
+                                     r.Amount,
+                                     CampaignId = r.Campaign!.Id,
+                                     CampaignName = r.Campaign.Name,
+                                     r.RejectionMemo,
+                                     RejectedBy = r.RejectedByUser != null ? r.RejectedByUser.FirstName : null,
+                                     r.DateCreated,
+                                     r.DeletedAt,
+                                     DeletedBy = r.DeletedByUser != null
+                                                ? $"{r.DeletedByUser.FirstName} {r.DeletedByUser.LastName}"
+                                                : null
+                                 })
+                                 .ToListAsync();
+
+            var recommendationStats = await query
+                                        .GroupBy(r => 1)
+                                        .Select(g => new
+                                        {
+                                            Pending = g.Where(r => r.Status!.ToLower().Trim() == "pending")
+                                                            .Sum(r => (decimal?)r.Amount) ?? 0m,
+                                            Approved = g.Where(r => r.Status!.ToLower().Trim() == "approved")
+                                                            .Sum(r => (decimal?)r.Amount) ?? 0m,
+                                        })
+                                        .FirstOrDefaultAsync();
 
             if (pagedData.Any())
                 return Ok(new
                 {
                     items = pagedData,
-                    totalCount = totalCount
+                    totalCount,
+                    recommendationStats!.Pending,
+                    recommendationStats.Approved,
+                    total = recommendationStats.Pending + recommendationStats.Approved
                 });
 
             return Ok(new { Success = false, Message = "Data not found." });
         }
 
         [HttpGet("{id}")]
-        [Authorize(Roles = "Admin")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<ActionResult<RecommendationsDto>> GetRecommendation(string id)
         {
             int recommendationId = Int32.Parse(id);
@@ -124,347 +171,264 @@ namespace Investment.Controllers
         }
 
         [HttpPost]
-        public async Task<IActionResult> CreateRecommendation([FromBody] AddRecommendationDto addRecommendation)
+        [ModuleAuthorize(PermissionType.Manage)]
+        public async Task<IActionResult> Create([FromBody] AddRecommendationDto addRecommendation)
         {
             CommonResponse response = new();
-            try
+            var allEmailTasks = new List<Task>();
+            User? user = null;
+
+            if (addRecommendation.User != null)
+                user = addRecommendation.User!;
+            else
+                user = await _context.Users.FirstOrDefaultAsync(i => i.Email == addRecommendation.UserEmail);
+
+            var userId = user!.Id;
+            var userFirstName = user?.FirstName;
+            var userLastName = user?.LastName;
+
+            CampaignDto campaign = addRecommendation.Campaign!;
+            var campaignId = campaign?.Id;
+            string? campaignName = campaign?.Name;
+            string? campaignProperty = campaign?.Property;
+            string? campaignDescription = campaign?.Description;
+            var campaignAddedTotalAdminRaised = campaign?.AddedTotalAdminRaised;
+            string? campaignContactInfoFullName = campaign?.ContactInfoFullName;
+            string? campaignContactInfoEmailAddress = campaign?.ContactInfoEmailAddress;
+
+            string investmentAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", Convert.ToDecimal(addRecommendation.Amount));
+
+            var recommendation = _mapper.Map<AddRecommendationDto, Recommendation>(addRecommendation);
+            recommendation.Status = "pending";
+            recommendation.CampaignId = campaignId;
+            recommendation.UserId = userId;
+            recommendation.DateCreated = DateTime.Now;
+            if (user?.AccountBalance < recommendation.Amount && !addRecommendation.IsGroupAccountBalance)
             {
-                var allEmailTasks = new List<Task>();
+                recommendation.Amount = user?.AccountBalance;
+            }
+            await _context.Recommendations.AddAsync(recommendation);
+            await _context.SaveChangesAsync();
 
-                User? user = null;
+            decimal originalInvestmentAmount = Convert.ToDecimal(recommendation.Amount);
 
-                if (addRecommendation.User != null)
-                    user = addRecommendation.User!;
-                else
-                    user = await _context.Users.FirstOrDefaultAsync(i => i.Email == addRecommendation.UserEmail);
+            var groupAccountBalances = await _context.GroupAccountBalance
+                                        .Include(gab => gab.Group)
+                                        .Where(gab => gab.User.Id == user!.Id)
+                                        .OrderBy(gab => gab.Id)
+                                        .ToListAsync();
 
-                var userId = user!.Id;
-                var userFirstName = user?.FirstName;
-                var userLastName = user?.LastName;
+            decimal totalGroupBalance = groupAccountBalances.Sum(gab => gab.Balance);
+            decimal amountToDeduct = Convert.ToDecimal(recommendation.Amount);
 
-                CampaignDto campaign = addRecommendation.Campaign!;
-                var campaignId = campaign?.Id;
-                string? campaignName = campaign?.Name;
-                string? campaignProperty = campaign?.Property;
-                string? campaignDescription = campaign?.Description;
-                var campaignAddedTotalAdminRaised = campaign?.AddedTotalAdminRaised;
-                string? campaignContactInfoFullName = campaign?.ContactInfoFullName;
-                string? campaignContactInfoEmailAddress = campaign?.ContactInfoEmailAddress;
+            if (!addRecommendation.IsGroupAccountBalance)
+            {
+                await AddPersonalDeduction(user!, amountToDeduct, campaignName!, campaignId, addRecommendation.PendingGrants?.DAFProvider);
+            }
+            else
+            {
+                amountToDeduct = await DeductFromGroupAccounts(user!, groupAccountBalances, amountToDeduct, campaignName!, campaignId);
 
-                string investmentAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", Convert.ToDecimal(addRecommendation.Amount));
-
-                var recommendation = _mapper.Map<AddRecommendationDto, Recommendation>(addRecommendation);
-                recommendation.Status = "pending";
-                recommendation.CampaignId = campaign!.Id;
-                recommendation.UserId = userId;
-                recommendation.DateCreated = DateTime.Now;
-                if (user?.AccountBalance < recommendation.Amount && !addRecommendation.IsGroupAccountBalance)
+                if (amountToDeduct > 0)
                 {
-                    recommendation.Amount = user?.AccountBalance;
-                }
-                await _context.Recommendations.AddAsync(recommendation);
-                await _context.SaveChangesAsync();
-
-                decimal originalInvestmentAmount = Convert.ToDecimal(recommendation.Amount);
-
-                var groupAccountBalances = await _context.GroupAccountBalance
-                                            .Include(gab => gab.Group)
-                                            .Where(gab => gab.User.Id == user!.Id)
-                                            .OrderBy(gab => gab.Id)
-                                            .ToListAsync();
-
-                decimal totalGroupBalance = groupAccountBalances.Sum(gab => gab.Balance);
-                decimal amountToDeduct = Convert.ToDecimal(recommendation.Amount);
-
-                if (!addRecommendation.IsGroupAccountBalance)
-                {
-                    await AddPersonalDeduction(user!, amountToDeduct, campaignName!);
-                }
-                else
-                {
-                    amountToDeduct = await DeductFromGroupAccounts(user!, groupAccountBalances, amountToDeduct, campaignName!);
-
-                    if (amountToDeduct > 0)
+                    if (user!.AccountBalance < amountToDeduct)
                     {
-                        if (user!.AccountBalance < amountToDeduct)
-                        {
-                            decimal shortfall = Convert.ToDecimal(amountToDeduct) - Convert.ToDecimal(user.AccountBalance);
-                            recommendation.Amount -= shortfall;
-                            amountToDeduct = Convert.ToDecimal(user.AccountBalance);
-                        }
-
-                        await AddPersonalDeduction(user, amountToDeduct, campaignName!);
+                        decimal shortfall = Convert.ToDecimal(amountToDeduct) - Convert.ToDecimal(user.AccountBalance);
+                        recommendation.Amount -= shortfall;
+                        amountToDeduct = Convert.ToDecimal(user.AccountBalance);
                     }
-                }
 
-                var usersToSendNotifications = await _context.Requests
+                    await AddPersonalDeduction(user, amountToDeduct, campaignName!, campaignId, addRecommendation.PendingGrants?.DAFProvider);
+                }
+            }
+
+            var usersToSendNotifications = await _context.Requests
+                                                .Where(i => i.UserToFollow != null
+                                                            && i.UserToFollow.Id == userId
+                                                            && i.Status == "accepted")
+                                                .Select(i => i.RequestOwner)
+                                                .ToListAsync();
+
+            var notifications = usersToSendNotifications.Select(userToSend => new UsersNotification
+            {
+                Title = "Recommendation created",
+                Description = $"Recommendation is created by user: {userFirstName} {userLastName}",
+                isRead = false,
+                PictureFileName = user!.ConsentToShowAvatar ? user?.PictureFileName : null,
+                TargetUser = userToSend!,
+                UrlToRedirect = $"/investment/{campaignId}"
+            }).ToList();
+
+            await _context.UsersNotifications.AddRangeAsync(notifications);
+            await _context.SaveChangesAsync();
+
+            await _repository.UserAuthentication.UpdateUser(user!);
+            await _repository.SaveAsync();
+
+
+            var requestHeader = HttpContext?.Request.Headers["Origin"].ToString() == null ? _httpContextAccessor.HttpContext?.Request.Headers["Origin"].ToString() : HttpContext?.Request.Headers["Origin"].ToString();
+
+            var userEmailsToSendEmailMessageCase = await _context.Requests
                                                     .Where(i => i.UserToFollow != null
-                                                                && i.UserToFollow.Id == userId
-                                                                && i.Status == "accepted")
-                                                    .Select(i => i.RequestOwner)
+                                                                && i.RequestOwner != null
+                                                                && i.UserToFollow.Id == userId)
+                                                    .Select(i => new UserEmailInfo
+                                                    {
+                                                        Email = i.RequestOwner!.Email,
+                                                        FirstName = i.RequestOwner.FirstName!,
+                                                        LastName = i.RequestOwner.LastName!
+                                                    }).ToListAsync();
+            var usersToSendEmailCase = await GetUsersForEmailsAsync(userEmailsToSendEmailMessageCase, null, true);
+            var emailsForGroupAndUser = usersToSendEmailCase.Select(i => new { i.Email, i.FirstName, i.LastName }).Distinct().ToList();
+
+
+            var userEmailsToSendEmailMessage = await _context.Requests
+                                                    .Where(i => i.RequestOwner != null
+                                                                && i.UserToFollow != null
+                                                                && i.RequestOwner.Id == userId)
+                                                    .Select(i => new { i.UserToFollow!.Email, i.UserToFollow.FirstName, i.UserToFollow.LastName })
                                                     .ToListAsync();
-
-                var notifications = usersToSendNotifications.Select(userToSend => new UsersNotification
-                {
-                    Title = "Recommendation created",
-                    Description = $"Recommendation is created by user: {userFirstName} {userLastName}",
-                    isRead = false,
-                    PictureFileName = user?.PictureFileName != null ? user?.PictureFileName : null,
-                    TargetUser = userToSend!,
-                    UrlToRedirect = $"/investment/{campaignId}"
-                }).ToList();
-
-                await _context.UsersNotifications.AddRangeAsync(notifications);
-                await _context.SaveChangesAsync();
-
-                await _repository.UserAuthentication.UpdateUser(user!);
-                await _repository.SaveAsync();
+            var emails = userEmailsToSendEmailMessage.Select(i => i.Email);
+            var usersToSendEmail = await _context.Users
+                                        .Where(u => emails.Contains(u.Email) && (u.OptOutEmailNotifications == null || !(bool)u.OptOutEmailNotifications))
+                                        .Select(u => u.Email)
+                                        .ToListAsync();
+            var rec = await _context.Recommendations.Where(i => i.Campaign != null && i.Campaign.Id == addRecommendation.Campaign!.Id && usersToSendEmail.Contains(i.UserEmail!)).ToListAsync();
+            var uniqueRec = rec.DistinctBy(x => new { x.UserEmail }).ToList();
 
 
-                var requestHeader = HttpContext?.Request.Headers["Origin"].ToString() == null ? _httpContextAccessor.HttpContext?.Request.Headers["Origin"].ToString() : HttpContext?.Request.Headers["Origin"].ToString();
+            var recommendationsQuery = _context.Recommendations
+                                            .AsNoTracking()
+                                            .Where(r =>
+                                                (r.Status == "approved" || r.Status == "pending") &&
+                                                r.Campaign != null &&
+                                                r.Campaign.Id == campaignId &&
+                                                r.Amount > 0 &&
+                                                r.UserEmail != null);
 
-                var userEmailsToSendEmailMessageCase = await _context.Requests
-                                                        .Where(i => i.UserToFollow != null
-                                                                    && i.RequestOwner != null
-                                                                    && i.UserToFollow.Id == userId)
-                                                        .Select(i => new UserEmailInfo
-                                                        {
-                                                            Email = i.RequestOwner!.Email,
-                                                            FirstName = i.RequestOwner.FirstName!,
-                                                            LastName = i.RequestOwner.LastName!
-                                                        }).ToListAsync();
-                var usersToSendEmailCase = await GetUsersForEmailsAsync(userEmailsToSendEmailMessageCase, null, true);
-                var emailsForGroupAndUser = usersToSendEmailCase.Select(i => new { i.Email, i.FirstName, i.LastName }).Distinct().ToList();
+            var totalDonationAmount = await recommendationsQuery.SumAsync(r => r.Amount ?? 0);
+            var totalInvestors = await recommendationsQuery.Select(r => r.UserEmail).Distinct().CountAsync();
 
+            var campaignIdentifier = campaignProperty ?? campaignId?.ToString();
 
-                var userEmailsToSendEmailMessage = await _context.Requests
-                                                        .Where(i => i.RequestOwner != null
-                                                                    && i.UserToFollow != null
-                                                                    && i.RequestOwner.Id == userId)
-                                                        .Select(i => new { i.UserToFollow!.Email, i.UserToFollow.FirstName, i.UserToFollow.LastName })
-                                                        .ToListAsync();
-                var emails = userEmailsToSendEmailMessage.Select(i => i.Email);
-                var usersToSendEmail = await _context.Users
-                                            .Where(u => emails.Contains(u.Email) && (u.OptOutEmailNotifications == null || !(bool)u.OptOutEmailNotifications))
-                                            .Select(u => u.Email)
-                                            .ToListAsync();
-                var rec = await _context.Recommendations.Where(i => i.Campaign != null && i.Campaign.Id == addRecommendation.Campaign!.Id && usersToSendEmail.Contains(i.UserEmail!)).ToListAsync();
-                var uniqueRec = rec.DistinctBy(x => new { x.UserEmail }).ToList();
+            string conditionalUserName = user?.IsAnonymousInvestment == true
+                ? "Someone"
+                : $"{userFirstName} {userLastName}";
 
+            string conditionalDonorName = user?.IsAnonymousInvestment == true
+                ? "An anonymous CataCap donor"
+                : $"{userFirstName} {userLastName}";
 
-                var recommendationsQuery = _context.Recommendations
-                                                .AsNoTracking()
-                                                .Where(r =>
-                                                    (r.Status == "approved" || r.Status == "pending") &&
-                                                    r.Campaign != null &&
-                                                    r.Campaign.Id == campaignId &&
-                                                    r.Amount > 0 &&
-                                                    r.UserEmail != null);
-
-                var totalDonationAmount = await recommendationsQuery.SumAsync(r => r.Amount ?? 0) + (campaignAddedTotalAdminRaised ?? 0);
-                var totalInvestors = await recommendationsQuery.Select(r => r.UserEmail).Distinct().CountAsync();
-
-                _ = Task.Run(async () =>
-                {
-                    string emailLogoUrl = $"{requestHeader}/logo-for-email.png";
-                    string emailLogo = $@"
-                                    <div style='text-align: center;'>
-                                        <a href='https://investment-campaign.org' target='_blank'>
-                                            <img src='{emailLogoUrl}' alt='Logo' width='300' height='150' />
-                                        </a>
-                                    </div>";
-
-                    var campaignIdentifier = campaignProperty ?? campaignId?.ToString();
-                    string conditionalUserName = user?.IsAnonymousInvestment == true ? "Someone" : $"{userFirstName} {userLastName}";
-                    string conditionalDonorName = user?.IsAnonymousInvestment == true ? "An anonymous Investment Campaign donor" : $"{userFirstName} {userLastName}";
-
-                    var emailTaskForFollowing = emailsForGroupAndUser.Select(email =>
-                    {
-                        var subject = $"👀 {conditionalUserName} Just Invested in {campaignName}";
-
-                        var body = emailLogo + $@"
-                                            <p><b>Hi {email.FirstName},</b></p>
-                                            <p>{conditionalDonorName} just made an investment in <b>{campaignName}</b> through Investment Campaign — and we thought you’d want to know.</p>
-                                            <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>
-                                            <p><div style='font-size: 20px;'><b>🌱 About {campaignName}</b></div></p>
-                                            <p>{campaignDescription}</p>
-                                            <p><b>🔗 Learn more here <a href='{requestHeader}/invest/{campaignIdentifier}'>Check it out</a>!</b></p>
-                                            <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>
-                                            <p>Thanks for being part of the growing Investment Campaign community — and for your commitment to moving capital toward real, scalable solutions.</p>
-                                            <p style='margin-bottom: 0px;'><b>Onward,</b></p>
-                                            <p style='margin-bottom: 0px; margin-top: 0px;'>The Investment Campaign Team</p>
-                                            <p style='margin-top: 0px;'>🌍 <a href='https://investment-campaign.org/'>investment-campaign.org</a> | 💼 <a href='https://www.linkedin.com/company/investment-campaign-us/'>Follow us on LinkedIn</a></p>
-                                            <p><a href='{requestHeader}/settings' target='_blank'>Unsubscribe</a> from Investment Campaign notifications.</p>
-                                        ";
-
-                        return _mailService.SendMailAsync(email.Email, subject, "", body);
-
-                    }).ToList();
-
-                    allEmailTasks.AddRange(emailTaskForFollowing);
-
-
-                    var emailTaskForMyFollowes = uniqueRec.Select(email =>
-                    {
-                        var subject = $"🎉 {conditionalUserName} Just Followed Your Lead on Investment Campaign!";
-                        var body = emailLogo + $@"
-                                        <p>Hi {email.UserFullName},</p>
-                                        <p>Big news—you’re inspiring change!</p>
-                                        <p>{conditionalUserName} who follows you on Investment Campaign, just made the same impact investment you did in {campaignName}. That’s right—your leadership is sparking action.</p>
-                                        <p>By investing in solutions that advance <b>Gender Equity</b>,<b> Racial Justice</b>, and more, you're not just backing bold ideas—you’re motivating others to do the same. That’s real influence.</p>
-                                        <p style='margin: 0px;'>Want to keep the momentum going?</p>
-                                        <p>Share the love and invite others to join you in investing in <b>{campaignName}</b>:</p>
-                                        <p>👉 <a href='{requestHeader}/invest/{campaignIdentifier}'>{campaignName}</a></p>
-                                        <p>Thanks for being a changemaker. We’re lucky to have you in the Investment Campaign community.</p>
-                                        <p style='margin-bottom: 0px;'>Onward,</p>
-                                        <p style='margin-bottom: 0px; margin-top: 0px;'>The Investment Campaign Team</p>
-                                        <p style='margin-top: 0px;'>🌍 <a href='https://investment-campaign.org/'>investment-campaign.org</a> | 💼 <a href='https://www.linkedin.com/company/investment-campaign-us/'>Follow us on LinkedIn</a></p>
-                                        <p><a href='{requestHeader}/settings' target='_blank'>Unsubscribe</a> from Investment Campaign notifications.</p>
-                                        ";
-
-                        return _mailService.SendMailAsync(email.UserEmail!, subject, "", body);
-
-                    }).ToList();
-
-                    allEmailTasks.AddRange(emailTaskForMyFollowes);
-
-
-                    if (!addRecommendation.IsRequestForInTransit)
-                    {
-                        if (user!.OptOutEmailNotifications == null || !(bool)user.OptOutEmailNotifications)
-                        {
-                            var subject = "Thank You for Fueling Impact with Your Donation";
-                            var body = emailLogo + $@"
-                                                <p><b>Hi {user.FirstName},</b></p>
-                                                <p>Thank you for your generous <b>contribution of {investmentAmount}</b> to Investment Campaign and your recommendation that it be allocated toward <b>{campaignName}</b>.</p>
-                                                <p>Your donation doesn’t just sit still — it goes to work, helping unlock capital for the most innovative and underfunded solutions on the planet. You’re helping drive real change by putting your capital where it counts.</p>
-                                                <p>Please keep this message for your tax records.</p>
-                                                <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>
-                                                <p><div style='font-size: 17px;'><b>Donation/Investment Summary</b></div></p>
-                                                <p style='margin-bottom: 0px;'><b>Recipient:</b> Investment Campaign</p>
-                                                <p style='margin-bottom: 0px; margin-top: 0px;'><b>EIN:</b> 86-2370923<br/></p>
-                                                <p style='margin-top: 0px;'><b>Address:</b> 213 West 85th Street, New York, NY 10024</p>
-                                                <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>
-                                                <p>Thank you for being part of this movement — and for backing the future we all want to live in.</p>
-                                                <p style='margin-bottom: 0px;'><b>Let’s keep building, together.</b></p>
-                                                <p style='margin-bottom: 0px; margin-top: 0px;'>Warmly,</p>
-                                                <p style='margin-bottom: 0px; margin-top: 0px;'>Shabbir Bharmal</p>
-                                                <p style='margin-top: 0px;'>Co-Founder, Investment Campaign</p>
-                                                <p style='margin-bottom: 0px;'>🌍 <a href='https://investment-campaign.org/'>investment-campaign.org</a> | 💼 <a href='https://www.linkedin.com/company/investment-campaign-us/'>Follow us on LinkedIn</a></p>
-                                                <p style='margin-top: 0px;'><a href='{requestHeader}/settings' target='_blank'>Unsubscribe</a> from Investment Campaign notifications.</p>
-                                            ";
-
-                            allEmailTasks.Add(_mailService.SendMailAsync(user.Email, subject, "", body));
-                        }
-                    }
-
-                    if (!string.IsNullOrEmpty(campaignContactInfoEmailAddress))
-                    {
-                        string formattedOriginalInvestmentAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", originalInvestmentAmount);
-                        string formattedtotalDonationAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", totalDonationAmount);
-                        string investorName = user?.IsAnonymousInvestment == true ? "a donor-investor" : $"{userFirstName} {userLastName}";
-
-                        var subject = "You Got Funded! Your Investment Campaign Is Growing";
-
-                        var body = emailLogo + $@"
-						                    <p><b>Hi {campaignContactInfoFullName?.Split(' ')[0]},</b></p>
-						                    <p>Great news — <b>{investorName}</b> just contributed <b>{formattedOriginalInvestmentAmount}</b> to your investment on Investment Campaign!</p>
-						                    <p>Your total raised is now <b>{formattedtotalDonationAmount}</b> from <b>{totalInvestors} incredible supporters</b> who believe in your mission. Every dollar is a vote of confidence in the impact you’re creating — and momentum is building.</p>
-						                    <p>🔗 <a href='{requestHeader}/invest/{campaignIdentifier}'>View your live investment page</a></p>
-						                    <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>
-						                    <p><div style='font-size: 20px;'><b>📣 Keep the Momentum Flowing</b></div></p>
-						                    <p>This is the perfect time to <b>share your page</b> with your network and invite others to join you. The more visibility your campaign has, the more catalytic it becomes. Check out your Investment Success Toolkit here.</p>
-						                    <p>We’re here to help — whether you need:</p>
-						                    <ul style='list-style-type:disc;'>
-							                    <li>Messaging support for an update</li>
-							                    <li>Share graphics or templates</li>
-							                    <li>Ideas to activate new networks</li>
-						                    </ul>
-						                    <p style='margin-top: 8px'><b>Let’s keep it going. Your impact deserves the spotlight.</b></p>
-                                            <p style='margin-bottom: 0px;'>With deep gratitude,</p>
-						                    <p style='margin-top: 0px;'>— The Investment Campaign Team</p>
-						                    <p>🌍 <a href='https://investment-campaign.org/'>investment-campaign.org</a> | 💼 <a href='https://www.linkedin.com/company/investment-campaign-us/'>Follow us on LinkedIn</a><br/>
-						                    <p><a href='{requestHeader}/settings' target='_blank'>Unsubscribe</a> from Investment Campaign notifications.</p>
-						                ";
-
-                        allEmailTasks.Add(_mailService.SendMailAsync(campaignContactInfoEmailAddress, subject, "", body));
-                    }
-                    await Task.WhenAll(allEmailTasks);
-                });
-
-                response.Success = true;
-                response.Message = "Recommendation created successfully.";
-
-                if (user != null)
-                    response.Data = _mapper.Map<UserDetailsDto>(user);
-
-                return Ok(response);
-            }
-            catch (Exception ex)
+            var commonVariables = new Dictionary<string, string>
             {
-                response.Success = false;
-                response.Message = $"An error occurred: {ex.Message}";
-                return BadRequest(response);
-            }
-        }
-
-        private async Task AddPersonalDeduction(User user, decimal amount, string investmentName)
-        {
-            var identity = HttpContext?.User.Identity as ClaimsIdentity == null ? _httpContextAccessor.HttpContext?.User.Identity as ClaimsIdentity : HttpContext.User.Identity as ClaimsIdentity;
-            var loginUserId = identity?.Claims.FirstOrDefault(i => i.Type == "id")?.Value;
-            var loginUser = await _repository.UserAuthentication.GetUserById(loginUserId!);
-            bool isAdmin = identity?.Claims.Any(c => c.Type == ClaimTypes.Role && c.Value == "Admin") == true;
-
-            var log = new AccountBalanceChangeLog
-            {
-                UserId = user.Id,
-                PaymentType = isAdmin ? $"Manually, {loginUser.UserName.Trim().ToLower()}" : "Manually",
-                OldValue = user.AccountBalance,
-                UserName = user.UserName,
-                NewValue = user.AccountBalance - amount,
-                InvestmentName = investmentName
+                { "campaignName", campaignName! },
+                { "campaignDescription", campaignDescription! },
+                { "campaignUrl", $"{_appSecrets.RequestOrigin}/investments/{campaignIdentifier}" },
+                { "unsubscribeUrl", $"{_appSecrets.RequestOrigin}/settings" },
+                { "investorDisplayName", conditionalUserName },
+                { "donorName", conditionalDonorName }
             };
 
-            user.AccountBalance -= amount;
-            await _context.AccountBalanceChangeLogs.AddAsync(log);
-        }
-
-        private async Task<decimal> DeductFromGroupAccounts(User user, List<GroupAccountBalance> balances, decimal amount, string investmentName)
-        {
-            var identity = HttpContext?.User.Identity as ClaimsIdentity == null ? _httpContextAccessor.HttpContext?.User.Identity as ClaimsIdentity : HttpContext.User.Identity as ClaimsIdentity;
-            var loginUserId = identity?.Claims.FirstOrDefault(i => i.Type == "id")?.Value;
-            var loginUser = await _repository.UserAuthentication.GetUserById(loginUserId!);
-            bool isAdmin = identity?.Claims.Any(c => c.Type == ClaimTypes.Role && c.Value == "Admin") == true;
-
-            foreach (var gab in balances)
+            foreach (var email in emailsForGroupAndUser)
             {
-                if (amount <= 0) break;
-                if (gab.Balance <= 0) continue;
-
-                decimal deduction = Math.Min(gab.Balance, amount);
-
-                var log = new AccountBalanceChangeLog
+                var variables = new Dictionary<string, string>(commonVariables)
                 {
-                    UserId = user.Id,
-                    PaymentType = isAdmin ? $"Manually, {loginUser.UserName.Trim().ToLower()}" : "Manually",
-                    OldValue = gab.Balance,
-                    UserName = user.UserName,
-                    NewValue = gab.Balance - deduction,
-                    InvestmentName = investmentName,
-                    GroupId = gab.Group.Id
+                    { "firstName", email.FirstName }
                 };
 
-                gab.Balance -= deduction;
-                amount -= deduction;
+                _emailQueue.QueueEmail(async (sp) =>
+                {
+                    var emailService = sp.GetRequiredService<IEmailTemplateService>();
 
-                await _context.AccountBalanceChangeLogs.AddAsync(log);
+                    await emailService.SendTemplateEmailAsync(
+                        EmailTemplateCategory.CampaignInvestmentNotification,
+                        email.Email,
+                        variables
+                    );
+                });
             }
 
-            return amount;
+            foreach (var email in uniqueRec)
+            {
+                var variables = new Dictionary<string, string>(commonVariables)
+                {
+                    { "userFullName", email.UserFullName! }
+                };
+
+                _emailQueue.QueueEmail(async (sp) =>
+                {
+                    var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                    await emailService.SendTemplateEmailAsync(
+                        EmailTemplateCategory.FollowerInfluenceNotification,
+                        email.UserEmail!,
+                        variables
+                    );
+                });
+            }
+
+            if (!addRecommendation.IsRequestForInTransit && (user!.OptOutEmailNotifications == null || !(bool)user.OptOutEmailNotifications))
+            {
+                var variables = new Dictionary<string, string>(commonVariables)
+                {
+                    { "firstName", user.FirstName! },
+                    { "investmentAmount", investmentAmount }
+                };
+
+                _emailQueue.QueueEmail(async (sp) =>
+                {
+                    var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                    await emailService.SendTemplateEmailAsync(
+                        EmailTemplateCategory.DonationConfirmation,
+                        user.Email,
+                        variables
+                    );
+                });
+            }
+
+            if (!string.IsNullOrEmpty(campaignContactInfoEmailAddress))
+            {
+                string formattedOriginalInvestmentAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", originalInvestmentAmount);
+                string formattedtotalDonationAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", totalDonationAmount);
+
+                string investorName = user?.IsAnonymousInvestment == true
+                    ? "a donor-investor"
+                    : $"{userFirstName} {userLastName}";
+
+                var variables = new Dictionary<string, string>(commonVariables)
+                {
+                    { "campaignFirstName", campaignContactInfoFullName?.Split(' ')[0] ?? "" },
+                    { "investorName", investorName },
+                    { "investmentAmount", formattedOriginalInvestmentAmount },
+                    { "totalRaised", formattedtotalDonationAmount },
+                    { "totalInvestors", totalInvestors.ToString() },
+                    { "campaignPageUrl", $"{_appSecrets.RequestOrigin}/investments/{campaignIdentifier}" }
+                };
+
+                _emailQueue.QueueEmail(async (sp) =>
+                {
+                    var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                    await emailService.SendTemplateEmailAsync(
+                        EmailTemplateCategory.CampaignOwnerFundingNotification,
+                        campaignContactInfoEmailAddress,
+                        variables
+                    );
+                });
+            }
+
+            response.Success = true;
+            response.Message = "Recommendation created successfully.";
+
+            if (user != null)
+                response.Data = _mapper.Map<UserDetailsDto>(user);
+
+            return Ok(response);
         }
 
         [HttpPost("feedback")]
-        //[Authorize(Roles = "User, Admin")]
+        [ModuleAuthorize(PermissionType.Manage)]
         public async Task<IActionResult> CreateFeedback([FromBody] InvestmentFeedbackDto investmentFeedback)
         {
             string userId = string.Empty;
@@ -506,79 +470,90 @@ namespace Investment.Controllers
             }
         }
 
-        [HttpPut("update-recommendation")]
-        [Authorize(Roles = "Admin")]
-        public async Task<IActionResult> UpdateRecommendation([FromBody] RecommendationsDto data)
+        [HttpPut("{id}")]
+        [ModuleAuthorize(PermissionType.Manage)]
+        public async Task<IActionResult> UpdateStatus(int id, [FromBody] RecommendationsDto data)
         {
-            try
+            if (data == null)
+                return BadRequest(new { Success = false, Message = "Data type is invalid" });
+
+            var recommendation = await _context.Recommendations
+                                                .Include(item => item.Campaign)
+                                                .Include(item => item.RejectedByUser)
+                                                .FirstOrDefaultAsync(item => item.Id == id);
+            if (recommendation == null)
+                return Ok(new { Success = false, Message = "Recommendation data not found" });
+
+            var user = await _repository.UserAuthentication.GetUserByEmail(recommendation?.UserEmail!);
+            if (user == null)
+                return Ok(new { Success = false, Message = "Recommendation cannot be rejected because the user does not exist" });
+
+            var identity = HttpContext.User.Identity as ClaimsIdentity;
+            var loginUserId = identity?.Claims.FirstOrDefault(i => i.Type == "id")?.Value;
+
+            recommendation!.Amount = data.Amount;
+            recommendation.Status = data.Status;
+            recommendation.UserEmail = data.UserEmail;
+
+            if (recommendation.Status == "rejected")
             {
-                if (data == null)
-                    return BadRequest(new { Success = false, Message = "Data type is invalid" });
-
-                var recommendation = await _context.Recommendations
-                                                    .Include(item => item.Campaign)
-                                                    .Include(item => item.RejectedByUser)
-                                                    .FirstOrDefaultAsync(item => item.Id == data.Id);
-                if (recommendation == null)
-                    return Ok(new { Success = false, Message = "Recommendation data not found" });
-
-                var user = await _repository.UserAuthentication.GetUserByEmail(recommendation?.UserEmail!);
-                if (user == null)
-                    return Ok(new { Success = false, Message = "Recommendation cannot be rejected because the user does not exist" });
-
-                var identity = HttpContext.User.Identity as ClaimsIdentity;
-                var loginUserId = identity?.Claims.FirstOrDefault(i => i.Type == "id")?.Value;
-
-                recommendation!.Amount = data.Amount;
-                recommendation.Status = data.Status;
-                recommendation.UserEmail = data.UserEmail;
-
-                if (recommendation.Status == "rejected")
+                var log = new AccountBalanceChangeLog
                 {
-                    var log = new AccountBalanceChangeLog
-                    {
-                        UserId = user.Id,
-                        PaymentType = $"Reverted Recommendation Amount, Recommendation Id= {recommendation?.Id}",
-                        InvestmentName = recommendation?.Campaign?.Name,
-                        OldValue = user.AccountBalance,
-                        UserName = user.UserName,
-                        NewValue = user.AccountBalance + recommendation?.Amount
-                    };
-                    await _context.AccountBalanceChangeLogs.AddAsync(log);
+                    UserId = user.Id,
+                    PaymentType = $"Recommendation reverted, Id = {recommendation?.Id}",
+                    InvestmentName = recommendation?.Campaign?.Name,
+                    CampaignId = recommendation?.CampaignId,
+                    OldValue = user.AccountBalance,
+                    UserName = user.UserName,
+                    NewValue = user.AccountBalance + recommendation?.Amount
+                };
+                await _context.AccountBalanceChangeLogs.AddAsync(log);
 
-                    user.AccountBalance += recommendation?.Amount;
-                    await _repository.UserAuthentication.UpdateUser(user);
+                user.AccountBalance += recommendation?.Amount;
+                await _repository.UserAuthentication.UpdateUser(user);
 
-                    recommendation!.RejectionMemo = data.RejectionMemo != string.Empty ? data.RejectionMemo?.Trim() : null;
-                    recommendation.RejectedBy = loginUserId!;
-                    recommendation.RejectionDate = DateTime.Now;
+                recommendation!.RejectionMemo = data.RejectionMemo != string.Empty ? data.RejectionMemo?.Trim() : null;
+                recommendation.RejectedBy = loginUserId!;
+                recommendation.RejectionDate = DateTime.Now;
+            }
+            await _repository.SaveAsync();
+
+            var rejectingUser = await _repository.UserAuthentication.GetUserById(loginUserId!);
+
+            return Ok(new
+            {
+                Success = true,
+                Message = "Recommendation status updated successfully.",
+                Data = new
+                {
+                    data.Status,
+                    RejectedBy = rejectingUser.FirstName!.Trim().ToLower(),
+                    recommendation?.RejectionMemo
                 }
-                await _repository.SaveAsync();
-
-                var rejectingUser = await _repository.UserAuthentication.GetUserById(loginUserId!);
-
-                return Ok(new
-                {
-                    Success = true,
-                    Message = "Recommendation status updated successfully.",
-                    Data = new
-                    {
-                        Status = data.Status,
-                        RejectedBy = rejectingUser.UserName.Trim().ToLower(),
-                        RejectionMemo = recommendation?.RejectionMemo
-                    }
-                });
-            }
-            catch (Exception ex)
-            {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
-            }
+            });
         }
 
-        [HttpGet("Export")]
+        [HttpGet("export")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<IActionResult> GetExportRecommendations()
         {
+            var usersQuery = _context.Users
+                                     .Join(_context.UserRoles,
+                                         u => u.Id,
+                                         ur => ur.UserId,
+                                         (u, ur) => new { u, ur })
+                                     .Join(_context.Roles,
+                                         x => x.ur.RoleId,
+                                         r => r.Id,
+                                         (x, r) => new { x.u, r })
+                                     .Where(x => x.r.Name == UserRoles.User)
+                                     .Select(x => x.u);
+
             var recommendations = await _context.Recommendations
+                                                .Join(usersQuery,
+                                                      r => r.UserEmail,
+                                                      u => u.Email,
+                                                      (r, u) => r)
                                                 .Include(r => r.Campaign)
                                                 .Include(r => r.RejectedByUser)
                                                 .ToListAsync();
@@ -639,78 +614,151 @@ namespace Investment.Controllers
         }
 
         [HttpGet("investment-recommendations-export")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<IActionResult> ExportInvestmentRecommendations(int investmentId)
         {
-            try
+            var recommendations = await _context.Recommendations
+                                            .Include(x => x.Campaign)
+                                            .Include(x => x.PendingGrants)
+                                            .Where(x => x.CampaignId == investmentId
+                                                        && (x.Status!.ToLower().Trim() == "pending"
+                                                            || x.Status!.ToLower().Trim() == "approved"))
+                                            .OrderByDescending(x => x.Id)
+                                            .ToListAsync();
+
+            if (!recommendations.Any())
+                return Ok(new { Success = false, Message = "There are no recommendations to export for your investment." });
+
+            string contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+            string fileName = "Recommendations.xlsx";
+
+            using (var workbook = new XLWorkbook())
             {
-                var recommendations = await _context.Recommendations
-                                                .Include(x => x.Campaign)
-                                                .Include(x => x.PendingGrants)
-                                                .Where(x => x.CampaignId == investmentId
-                                                            && (x.Status!.ToLower().Trim() == "pending"
-                                                                || x.Status!.ToLower().Trim() == "approved"))
-                                                .OrderByDescending(x => x.Id)
-                                                .ToListAsync();
+                IXLWorksheet worksheet = workbook.Worksheets.Add("Recommendations");
 
-                if (!recommendations.Any())
-                    return Ok(new { Success = false, Message = "There are no recommendations to export for your investment." });
+                worksheet.Cell(1, 1).Value = "UserFullName";
+                worksheet.Cell(1, 2).Value = "InvestmentName";
+                worksheet.Cell(1, 3).Value = "Amount";
+                worksheet.Cell(1, 4).Value = "DateCreated";
+                worksheet.Cell(1, 5).Value = "InTransitGrant?";
 
-                string contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
-                string fileName = "Recommendations.xlsx";
+                var headerRow = worksheet.Row(1);
+                headerRow.Style.Font.Bold = true;
+                worksheet.Columns().Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Left;
 
-                using (var workbook = new XLWorkbook())
+                for (int index = 0; index < recommendations.Count; index++)
                 {
-                    IXLWorksheet worksheet = workbook.Worksheets.Add("Recommendations");
+                    var dto = recommendations[index];
+                    int row = index + 2;
+                    int col = 1;
 
-                    worksheet.Cell(1, 1).Value = "UserFullName";
-                    worksheet.Cell(1, 2).Value = "InvestmentName";
-                    worksheet.Cell(1, 3).Value = "Amount";
-                    worksheet.Cell(1, 4).Value = "DateCreated";
-                    worksheet.Cell(1, 5).Value = "PendingGrant?";
+                    worksheet.Cell(row, col++).Value = dto.UserFullName;
+                    worksheet.Cell(row, col++).Value = dto.Campaign!.Name;
 
-                    var headerRow = worksheet.Row(1);
-                    headerRow.Style.Font.Bold = true;
-                    worksheet.Columns().Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Left;
+                    var amountCell = worksheet.Cell(row, col++);
+                    amountCell.Value = dto.Amount;
+                    amountCell.Style.NumberFormat.Format = "$#,##0.00";
 
-                    for (int index = 0; index < recommendations.Count; index++)
-                    {
-                        var dto = recommendations[index];
-                        int row = index + 2;
-                        int col = 1;
+                    var dateCreatedCell = worksheet.Cell(row, col++);
+                    dateCreatedCell.Value = dto.DateCreated;
+                    dateCreatedCell.Style.DateFormat.Format = "MM/dd/yy HH:mm";
 
-                        worksheet.Cell(row, col++).Value = dto.UserFullName;
-                        worksheet.Cell(row, col++).Value = dto.Campaign!.Name;
+                    worksheet.Cell(row, col++).Value = dto.PendingGrants != null
+                                                            ? dto.PendingGrants.status!.ToLower().Trim() == "in transit"
+                                                                ? "Yes"
+                                                                : ""
+                                                            : "";
+                }
 
-                        var amountCell = worksheet.Cell(row, col++);
-                        amountCell.Value = dto.Amount;
-                        amountCell.Style.NumberFormat.Format = "$#,##0.00";
+                worksheet.Columns().AdjustToContents();
 
-                        var dateCreatedCell = worksheet.Cell(row, col++);
-                        dateCreatedCell.Value = dto.DateCreated;
-                        dateCreatedCell.Style.DateFormat.Format = "MM/dd/yy HH:mm";
+                foreach (var column in worksheet.Columns())
+                {
+                    column.Width += 5;
+                }
 
-                        worksheet.Cell(row, col++).Value = dto.PendingGrants != null ? "Yes" : "";
-                    }
-
-                    worksheet.Columns().AdjustToContents();
-
-                    foreach (var column in worksheet.Columns())
-                    {
-                        column.Width += 5;
-                    }
-
-                    using (var stream = new MemoryStream())
-                    {
-                        workbook.SaveAs(stream);
-                        var content = stream.ToArray();
-                        return File(content, contentType, fileName);
-                    }
+                using (var stream = new MemoryStream())
+                {
+                    workbook.SaveAs(stream);
+                    var content = stream.ToArray();
+                    return File(content, contentType, fileName);
                 }
             }
-            catch (Exception ex)
+        }
+
+        private async Task AddPersonalDeduction(User user, decimal amount, string investmentName, int? campaignId, string? grantType)
+        {
+            var identity = HttpContext?.User.Identity as ClaimsIdentity == null ? _httpContextAccessor.HttpContext?.User.Identity as ClaimsIdentity : HttpContext.User.Identity as ClaimsIdentity;
+            var loginUserId = identity?.Claims.FirstOrDefault(i => i.Type == "id")?.Value;
+            var loginUser = await _repository.UserAuthentication.GetUserById(loginUserId!);
+
+            bool isAdmin = identity?.Claims.Any(c => c.Type == ClaimTypes.Role && (c.Value == UserRoles.Admin || c.Value == UserRoles.SuperAdmin)) == true;
+
+            if (!string.IsNullOrWhiteSpace(grantType))
             {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
+                grantType = grantType.ToLower() == "foundation grant"
+                            ? "Foundation grant"
+                            : "DAF grant";
             }
+
+            string? paymentType = !string.IsNullOrWhiteSpace(grantType)
+                                    ? grantType
+                                        : null;
+
+            if (string.IsNullOrWhiteSpace(paymentType))
+                paymentType = "Recommendation created using account balance";
+            else if (isAdmin)
+                paymentType = $"{paymentType}, {loginUser?.UserName?.Trim().ToLower()}";
+
+            var log = new AccountBalanceChangeLog
+            {
+                UserId = user.Id,
+                PaymentType = paymentType,
+                OldValue = user.AccountBalance,
+                UserName = user.UserName,
+                NewValue = user.AccountBalance - amount,
+                InvestmentName = investmentName,
+                CampaignId = campaignId
+            };
+
+            user.AccountBalance -= amount;
+            await _context.AccountBalanceChangeLogs.AddAsync(log);
+        }
+
+        private async Task<decimal> DeductFromGroupAccounts(User user, List<GroupAccountBalance> balances, decimal amount, string investmentName, int? campaignId)
+        {
+            var identity = HttpContext?.User.Identity as ClaimsIdentity == null ? _httpContextAccessor.HttpContext?.User.Identity as ClaimsIdentity : HttpContext.User.Identity as ClaimsIdentity;
+            var loginUserId = identity?.Claims.FirstOrDefault(i => i.Type == "id")?.Value;
+            var loginUser = await _repository.UserAuthentication.GetUserById(loginUserId!);
+
+            bool isAdmin = identity?.Claims.Any(c => c.Type == ClaimTypes.Role && (c.Value == UserRoles.Admin || c.Value == UserRoles.SuperAdmin)) == true;
+
+            foreach (var gab in balances)
+            {
+                if (amount <= 0) break;
+                if (gab.Balance <= 0) continue;
+
+                decimal deduction = Math.Min(gab.Balance, amount);
+
+                var log = new AccountBalanceChangeLog
+                {
+                    UserId = user.Id,
+                    PaymentType = isAdmin ? $"Recommendation created using group balance, {loginUser.UserName!.Trim().ToLower()}" : "Recommendation created using group balance",
+                    OldValue = gab.Balance,
+                    UserName = user.UserName,
+                    NewValue = gab.Balance - deduction,
+                    InvestmentName = investmentName,
+                    CampaignId = campaignId,
+                    GroupId = gab.Group.Id
+                };
+
+                gab.Balance -= deduction;
+                amount -= deduction;
+
+                await _context.AccountBalanceChangeLogs.AddAsync(log);
+            }
+
+            return amount;
         }
 
         private async Task<List<UserEmailInfo>> GetUsersForEmailsAsync(
@@ -722,10 +770,10 @@ namespace Investment.Controllers
 
             return await _context.Users
                                 .Where(u => emails.Contains(u.Email) &&
-                                            (u.OptOutEmailNotifications == null || !(u.OptOutEmailNotifications)) &&
+                                            (u.OptOutEmailNotifications == null || !(u.OptOutEmailNotifications ?? false)) &&
                                             (
-                                                (emailFromGroupsOn == true && (u.EmailFromGroupsOn)) ||
-                                                (emailFromUsersOn == true && (u.EmailFromUsersOn))
+                                                (emailFromGroupsOn == true && (u.EmailFromGroupsOn ?? false)) ||
+                                                (emailFromUsersOn == true && (u.EmailFromUsersOn ?? false))
                                             ))
                                 .Select(u => new UserEmailInfo
                                 {

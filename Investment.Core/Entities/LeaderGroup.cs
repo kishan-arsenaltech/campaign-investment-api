@@ -1,6 +1,6 @@
 ﻿namespace Investment.Core.Entities
 {
-    public class LeaderGroup
+    public class LeaderGroup : BaseEntity
     {
         public int Id { get; set; }
         public string UserId { get; set; } = string.Empty;

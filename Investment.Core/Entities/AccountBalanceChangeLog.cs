@@ -2,15 +2,21 @@
 
 namespace Invest.Core.Entities
 {
-    public class AccountBalanceChangeLog
+    public class AccountBalanceChangeLog : BaseEntity
     {
         public int Id { get; set; }
         /// <summary>
         public string UserId { get; set; } = string.Empty;
         public User? User { get; set; }
+        /// </summary>
+        public int? CampaignId { get; set; }
+        public CampaignDto? Campaign { get; set; }
         public string? InvestmentName { get; set; }
         public string? PaymentType { get; set; }
         public decimal? OldValue { get; set; }
+        public decimal GrossAmount { get; set; }
+        public decimal Fees { get; set; }
+        public decimal NetAmount { get; set; }
         public string UserName { get; set; } = string.Empty;
         public decimal? NewValue { get; set; }
         public int? GroupId { get; set; }
@@ -20,5 +26,7 @@ namespace Invest.Core.Entities
         public PendingGrants? PendingGrants { get; set; }
         public string? TransactionStatus { get; set; }
         public string? Reference { get; set; }
+        public string? Comment { get; set; }
+        public string? ZipCode { get; set; }
     }
 }

@@ -1,6 +1,6 @@
 ﻿namespace Investment.Core.Entities
 {
-    public class FollowingRequest
+    public class FollowingRequest : BaseEntity
     {
         public int Id { get; set; }
         public User? RequestOwner { get; set; }

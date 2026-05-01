@@ -2,7 +2,7 @@
 
 namespace Investment.Core.Entities
 {
-    public class PendingGrants
+    public class PendingGrants : BaseEntity
     {
         public int Id { get; set; }
         public string UserId { get; set; } = string.Empty;
@@ -26,5 +26,6 @@ namespace Investment.Core.Entities
 
         [Column(TypeName = "datetime")]
         public DateTime? RejectionDate { get; set; }
+        public string? Address { get; set; }
     }
 }

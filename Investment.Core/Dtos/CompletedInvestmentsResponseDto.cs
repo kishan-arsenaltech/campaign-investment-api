@@ -6,5 +6,6 @@
         public string? TypeOfInvestmentIds { get; set; }
         public decimal? ApprovedRecommendationsAmount { get; set; }
         public decimal? PendingRecommendationsAmount { get; set; }
+        public string? InvestmentVehicle { get; set; }
     }
 }

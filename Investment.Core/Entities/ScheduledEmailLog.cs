@@ -2,7 +2,7 @@
 
 namespace Investment.Core.Entities
 {
-    public class ScheduledEmailLog
+    public class ScheduledEmailLog : BaseEntity
     {
         public int Id { get; set; }
         public int PendingGrantId { get; set; }

@@ -1,4 +1,6 @@
-﻿namespace Invest.Core.Entities
+﻿using Investment.Core.Dtos;
+
+namespace Invest.Core.Entities
 {
     public class CardPayment
     {
@@ -13,13 +15,9 @@
         public bool RememberCardDetail { get; set; }
         public int? InvestmentId { get; set; }
         public string? Reference { get; set; }
-        public BillingDetails? BillingDetails { get; set; }
-    }
-
-    public class BillingDetails
-    {
-        public string? Country { get; set; }
-        public string? ZipCode { get; set; }
+        public bool CoverFees { get; set; }
+        public decimal InvestmentAmountWithFees { get; set; }
+        public AddressDto? Address { get; set; }
     }
 
     public class PaymentMethodDetails

@@ -1,518 +1,593 @@
 ﻿using AutoMapper;
-using Azure.Storage.Blobs;
 using ClosedXML.Excel;
+using Invest.Authorization.Enums;
 using Invest.Core.Entities;
+using Invest.Core.Settings;
+using Investment.Authorization.Attributes;
+using Investment.Authorization.Enums;
+using Investment.Core.Constants;
 using Investment.Core.Dtos;
 using Investment.Core.Entities;
-using Investment.Extensions;
+using Investment.Core.Extensions;
 using Investment.Repo.Context;
 using Investment.Service.Interfaces;
+using Investment.Service.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using System.Security.Claims;
-using System.Text;
 using System.Text.Json;
 
 namespace Investment.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
+    [Module(Modules.PendingGrants)]
     public class PendingGrantsAdmin : ControllerBase
     {
         private readonly RepositoryContext _context;
         private readonly IMapper _mapper;
-        private readonly IMailService _mailService;
-        private readonly BlobContainerClient _blobContainerClient;
         protected readonly IRepositoryManager _repository;
-        private readonly IConfiguration _configuration;
-        private readonly KeyVaultConfigService _keyVaultConfigService;
+        private readonly AppSecrets _appSecrets;
         private readonly IHttpContextAccessor _httpContextAccessors;
-        private readonly HttpClient _httpClient;
-        private readonly IWebHostEnvironment _environment;
-        private readonly string defaultPassword = "SEcurE!Pa$$w0rd_#2025";
+        private readonly EmailQueue _emailQueue;
 
-        public PendingGrantsAdmin(RepositoryContext context, IMapper mapper, IMailService mailService, BlobContainerClient blobContainerClient, IRepositoryManager repository, IConfiguration configuration, KeyVaultConfigService keyVaultConfigService, IHttpContextAccessor httpContextAccessors, HttpClient httpClient, IWebHostEnvironment environment)
+        public PendingGrantsAdmin(RepositoryContext context, IMapper mapper, IRepositoryManager repository, AppSecrets appSecrets, IHttpContextAccessor httpContextAccessors, EmailQueue emailQueue)
         {
             _context = context;
             _mapper = mapper;
-            _mailService = mailService;
-            _blobContainerClient = blobContainerClient;
             _repository = repository;
-            _configuration = configuration;
-            _keyVaultConfigService = keyVaultConfigService;
+            _appSecrets = appSecrets;
             _httpContextAccessors = httpContextAccessors;
-            _httpClient = httpClient;
-            _environment = environment;
+            _emailQueue = emailQueue;
         }
 
-        [HttpPost("get-pending-grants")]
-        public async Task<IActionResult> GetAll([FromBody] PaginationDto pagination)
+        [HttpGet]
+        [ModuleAuthorize(PermissionType.View)]
+        public async Task<IActionResult> Get([FromQuery] PaginationDto pagination, string? dafProvider)
         {
-            try
-            {
-                bool isAsc = pagination?.SortDirection?.ToLower() == "asc";
-                var statusList = pagination?.Status?.Split(',', StringSplitOptions.RemoveEmptyEntries)
-                                                    .Select(s => s.Trim().ToLower())
-                                                    .ToList();
-                var now = DateTime.UtcNow;
+            bool isAsc = pagination?.SortDirection?.ToLower() == "asc";
+            bool? isDeleted = pagination?.IsDeleted;
 
-                var query = _context.PendingGrants
-                    .Where(i => statusList == null || statusList.Count == 0 ||
-                                (statusList.Contains("pending")
-                                    ? (string.IsNullOrEmpty(i.status) && statusList.Contains("pending")) ||
-                                      (!string.IsNullOrEmpty(i.status) && statusList.Contains(i.status.ToLower()))
-                                    : (!string.IsNullOrEmpty(i.status) && statusList.Contains(i.status.ToLower()))
+            var statusList = pagination?.Status?.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                                .Select(s => s.Trim().ToLower())
+                                                .ToList();
+            var now = DateTime.UtcNow;
+
+            var dafProviders = await _context.DAFProviders
+                                             .Select(x => x.ProviderName!.ToLower().Trim())
+                                             .ToListAsync();
+
+            var providerList = string.IsNullOrEmpty(dafProvider)
+                                ? new List<string>()
+                                : dafProvider.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                             .Select(x => x.Trim().ToLower())
+                                             .ToList();
+
+            var hasOther = providerList.Contains("other");
+
+            var selectedProviders = providerList
+                                    .Where(p => p != "other")
+                                    .ToList();
+
+            var query = _context.PendingGrants
+                                .ApplySoftDeleteFilter(isDeleted)
+                                .Where(i => (statusList == null || statusList.Count == 0 ||
+                                                (statusList.Contains("pending")
+                                                    ? string.IsNullOrEmpty(i.status) && statusList.Contains("pending") ||
+                                                        !string.IsNullOrEmpty(i.status) && statusList.Contains(i.status.ToLower())
+                                                    : !string.IsNullOrEmpty(i.status) && statusList.Contains(i.status.ToLower())
+                                                )
+                                            )
+                                            && (string.IsNullOrEmpty(pagination!.SearchValue)
+                                                || (i.User.FirstName + " " + i.User.LastName).ToLower().Contains(pagination.SearchValue.ToLower())
+                                                || i.User.Email.ToLower().Contains(pagination.SearchValue.ToLower())
+                                            )
+                                            && (
+                                                providerList.Count == 0
+                                                || selectedProviders.Contains(i.DAFProvider.ToLower().Trim())
+
+                                                || (
+                                                    hasOther
+                                                    && !dafProviders.Contains(i.DAFProvider.ToLower().Trim())
+                                                    && i.DAFProvider.ToLower().Trim() != "foundation grant"
+                                                )
+                                            )
                                 )
-                    )
-                    .Select(i => new
-                    {
-                        i.Id,
-                        i.User.FirstName,
-                        i.User.LastName,
-                        i.User.Email,
-                        i.Amount,
-                        i.AmountAfterFees,
-                        i.DAFName,
-                        i.DAFProvider,
-                        InvestmentName = i.Campaign!.Name,
-                        Reference = i.Reference,
-                        Status = string.IsNullOrEmpty(i.status) ? "Pending" : i.status,
-                        i.RejectionMemo,
-                        RejectedBy = i.RejectedByUser!.FirstName,
-                        i.CreatedDate
-                    });
+                                .Select(i => new
+                                {
+                                    i.Id,
+                                    i.User.FirstName,
+                                    i.User.LastName,
+                                    i.User.Email,
+                                    i.Amount,
+                                    i.AmountAfterFees,
+                                    i.DAFName,
+                                    i.DAFProvider,
+                                    InvestmentName = i.Campaign!.Name,
+                                    i.Reference,
+                                    Status = string.IsNullOrEmpty(i.status) ? "Pending" : i.status,
+                                    i.CreatedDate,
+                                    i.DeletedAt,
+                                    i.DeletedByUser
+                                });
 
-                switch (pagination?.SortField?.ToLower())
-                {
-                    case "fullname":
-                        query = isAsc
-                                    ? query.OrderBy(i => i.Status.ToLower() == "rejected" ? 1 : 0)
-                                           .ThenBy(i => i.FirstName)
-                                           .ThenBy(i => i.LastName)
-                                    : query.OrderBy(i => i.Status.ToLower() == "rejected" ? 1 : 0)
-                                           .ThenByDescending(i => i.FirstName)
-                                           .ThenByDescending(i => i.LastName);
-                        break;
-
-                    case "createddate":
-                        query = isAsc
-                                    ? query.OrderBy(i => i.Status.ToLower() == "rejected" ? 1 : 0)
-                                           .ThenBy(i => i.CreatedDate ?? DateTime.MaxValue)
-                                    : query.OrderBy(i => i.Status.ToLower() == "rejected" ? 1 : 0)
-                                           .ThenByDescending(i => i.CreatedDate ?? DateTime.MinValue);
-                        break;
-
-                    case "status":
-                        query = isAsc
-                                    ? query.OrderBy(i => i.Status)
-                                    : query.OrderByDescending(i => i.Status);
-                        break;
-
-                    case "dayscount":
-                        query = isAsc
-                                    ? query.OrderBy(i => i.Status.ToLower() == "pending" ? 0
-                                                            : (string.IsNullOrEmpty(i.Status)
-                                                            ? 2 : 1))
-                                           .ThenBy(i => i.CreatedDate ?? DateTime.MaxValue)
-                                    : query.OrderBy(i => i.Status.ToLower() == "pending" ? 0
-                                                            : (string.IsNullOrEmpty(i.Status)
-                                                            ? 2 : 1))
-                                           .ThenByDescending(i => i.CreatedDate ?? DateTime.MinValue);
-                        break;
-
-                    default:
-                        query = query.OrderBy(i => i.Status.ToLower() == "rejected")
-                                     .ThenByDescending(i => i.CreatedDate);
-                        break;
-                }
-
-                int page = pagination?.CurrentPage ?? 1;
-                int pageSize = pagination?.PerPage ?? 50;
-                int totalCount = await query.CountAsync();
-
-                var results = await query.Skip((page - 1) * pageSize).Take(pageSize).ToListAsync();
-
-                var pagedData = results.Select(i => new
-                {
-                    i.Id,
-                    i.FirstName,
-                    i.LastName,
-                    FullName = i.FirstName + " " + i.LastName,
-                    i.Email,
-                    i.Amount,
-                    i.AmountAfterFees,
-                    i.DAFName,
-                    i.DAFProvider,
-                    InvestmentName = i.InvestmentName,
-                    Reference = i.Reference,
-                    Status = string.IsNullOrEmpty(i.Status) ? "Pending" : i.Status,
-                    i.RejectionMemo,
-                    i.RejectedBy,
-                    i.CreatedDate,
-                    DaysCount = (!string.IsNullOrEmpty(i.Status) && i.Status.ToLower() == "pending" && i.CreatedDate != null)
-                                    ? GetReadableDuration(i.CreatedDate.Value, now)
-                                    : null
-                }).ToList();
-
-                if (pagedData.Any())
-                    return Ok(new { items = pagedData, totalCount });
-
-                return Ok(new { Success = false, Message = "Data not found." });
-            }
-            catch (Exception ex)
+            switch (pagination?.SortField?.ToLower())
             {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
+                case "fullname":
+                    query = isAsc
+                                ? query.OrderBy(i => i.Status.ToLower() == "rejected" ? 1 : 0)
+                                        .ThenBy(i => i.FirstName)
+                                        .ThenBy(i => i.LastName)
+                                : query.OrderBy(i => i.Status.ToLower() == "rejected" ? 1 : 0)
+                                        .ThenByDescending(i => i.FirstName)
+                                        .ThenByDescending(i => i.LastName);
+                    break;
+
+                case "createddate":
+                    query = isAsc
+                                ? query.OrderBy(i => i.Status.ToLower() == "rejected" ? 1 : 0)
+                                        .ThenBy(i => i.CreatedDate ?? DateTime.MaxValue)
+                                : query.OrderBy(i => i.Status.ToLower() == "rejected" ? 1 : 0)
+                                        .ThenByDescending(i => i.CreatedDate ?? DateTime.MinValue);
+                    break;
+
+                case "status":
+                    query = isAsc
+                                ? query.OrderBy(i => i.Status)
+                                : query.OrderByDescending(i => i.Status);
+                    break;
+
+                case "dayscount":
+                    query = isAsc
+                                ? query.OrderBy(i => i.Status.ToLower() == "pending" ? 0
+                                                        : string.IsNullOrEmpty(i.Status)
+                                                        ? 2 : 1)
+                                        .ThenBy(i => i.CreatedDate ?? DateTime.MaxValue)
+                                : query.OrderBy(i => i.Status.ToLower() == "pending" ? 0
+                                                        : string.IsNullOrEmpty(i.Status)
+                                                        ? 2 : 1)
+                                        .ThenByDescending(i => i.CreatedDate ?? DateTime.MinValue);
+                    break;
+
+                default:
+                    query = query.OrderBy(i => i.Status.ToLower() == "rejected")
+                                    .ThenByDescending(i => i.CreatedDate);
+                    break;
             }
+
+            int page = pagination?.CurrentPage ?? 1;
+            int pageSize = pagination?.PerPage ?? 50;
+            int totalCount = await query.CountAsync();
+
+            var results = await query.Skip((page - 1) * pageSize).Take(pageSize).ToListAsync();
+
+            var pagedData = results.Select(i => new
+            {
+                i.Id,
+                i.FirstName,
+                i.LastName,
+                FullName = i.FirstName + " " + i.LastName,
+                i.Email,
+                i.Amount,
+                i.AmountAfterFees,
+                i.DAFName,
+                i.DAFProvider,
+                i.InvestmentName,
+                i.Reference,
+                Status = string.IsNullOrEmpty(i.Status) ? "Pending" : i.Status,
+                i.CreatedDate,
+                DaysCount = !string.IsNullOrEmpty(i.Status) && i.Status.ToLower() == "pending" && i.CreatedDate != null
+                                ? GetReadableDuration(i.CreatedDate.Value, now)
+                                : null,
+                i.DeletedAt,
+                DeletedBy = i.DeletedByUser != null
+                            ? $"{i.DeletedByUser.FirstName} {i.DeletedByUser.LastName}"
+                            : null
+            }).ToList();
+
+            if (pagedData.Any())
+                return Ok(new { items = pagedData, totalCount });
+
+            return Ok(new { Success = false, Message = "Data not found." });
         }
 
-        [HttpGet("get-daf-providers")]
+        [HttpGet("daf-providers")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<IActionResult> GetDAFProviders()
         {
-            try
-            {
-                var dafProviders = await _context.DAFProviders
-                                                 .Select(x => new
-                                                 {
-                                                     Value = x.ProviderName,
-                                                     Link = x.ProviderURL
-                                                 })
-                                                 .ToListAsync();
+            var dafProviders = await _context.DAFProviders
+                                             .Select(x => new
+                                             {
+                                                 x.Id,
+                                                 Value = x.ProviderName,
+                                                 Link = x.ProviderURL
+                                             })
+                                             .ToListAsync();
 
-                if (dafProviders.Any())
-                    return Ok(dafProviders);
+            if (dafProviders.Any())
+                return Ok(dafProviders);
 
-                return Ok(new { Success = false, Message = "Data not found." });
-            }
-            catch (Exception ex)
-            {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
-            }
+            return Ok(new { Success = false, Message = "Data not found." });
         }
 
-        private static string GetReadableDuration(DateTime from, DateTime to)
+        [HttpPut("{id}")]
+        [ModuleAuthorize(PermissionType.Manage)]
+        public async Task<IActionResult> UpdateStatus(int id, [FromBody] UpdatePendingGrantsDto pendingGrantsData)
         {
-            int years = to.Year - from.Year;
-            int months = to.Month - from.Month;
-            int days = to.Day - from.Day;
+            var pendingGrant = await _context.PendingGrants
+                                             .Include(p => p.Campaign)
+                                             .Include(p => p.User)
+                                             .FirstOrDefaultAsync(i => i.Id == id);
+            if (pendingGrant == null)
+                return BadRequest(new { Success = false, Message = "Wrong pending grand id." });
 
-            if (days < 0)
+            pendingGrant.ModifiedDate = DateTime.Now;
+
+            string currentStatus = pendingGrant.status ?? "Pending";
+            decimal pendingGrandAmount = Convert.ToDecimal(pendingGrant.Amount);
+
+            var identity = HttpContext.User.Identity as ClaimsIdentity;
+            var loginUserId = identity?.Claims.FirstOrDefault(i => i.Type == "id")?.Value;
+            var loginUser = await _repository.UserAuthentication.GetUserById(loginUserId!);
+
+            if (pendingGrantsData.Status == "In Transit" && currentStatus == "Pending")
             {
-                months--;
-                days += DateTime.DaysInMonth(from.Year, from.Month);
+                var user = await _context.Users.FirstOrDefaultAsync(i => i.Email == pendingGrant.User.Email);
+                if (user == null)
+                    return BadRequest(new { Success = false, Message = "User not found." });
+
+                bool isFreeUser = user.IsFreeUser.GetValueOrDefault();
+                decimal totalCataCapFee = pendingGrandAmount * 0.05m; //CataCap Fee
+                decimal amount = pendingGrant.AmountAfterFees > 0 ? pendingGrant.AmountAfterFees ?? 0m : (pendingGrandAmount - totalCataCapFee);
+
+                var groupAccountBalance = await _context.GroupAccountBalance
+                                                .Include(gab => gab.Group)
+                                                .Where(gab => gab.User.Id == user.Id)
+                                                .OrderBy(gab => gab.Id)
+                                                .ToListAsync();
+
+                decimal totalGroupBalance = groupAccountBalance.Sum(gab => gab.Balance);
+                decimal fromWallet = Convert.ToDecimal(pendingGrant.InvestedSum) - (pendingGrandAmount + totalGroupBalance);
+
+                if (user.AccountBalance < fromWallet)
+                    return Ok(new { Success = false, Message = "User do not have sufficient wallet balance." });
+
+                pendingGrant.status = "In Transit";
+
+                var grantType = pendingGrant.DAFProvider.ToLower().Trim() == "foundation grant" ? "Foundation grant" : "DAF grant";
+
+                string? zipCode = null;
+                if (!string.IsNullOrWhiteSpace(pendingGrant.Address))
+                {
+                    var address = JsonSerializer.Deserialize<AddressDto>(pendingGrant.Address);
+                    zipCode = address?.ZipCode;
+                }
+
+                decimal fees = pendingGrant.GrantAmount - pendingGrant.AmountAfterFees ?? 0m;
+
+                var balanceResult = await UpdateAccountBalance(pendingGrant.User.Email, amount, pendingGrandAmount, fees, grantType, pendingGrant.Id, pendingGrant.TotalInvestedAmount ?? 0m, pendingGrant.Reference, pendingGrant.Campaign?.Name, zipCode);
+                if (!balanceResult.Success)
+                    return Ok(new { Success = false, balanceResult.Message });
+
+                decimal totalAvailable = Convert.ToDecimal(user.AccountBalance + amount + totalGroupBalance);
+                decimal finalInvestmentAmount = Math.Min(totalAvailable, Convert.ToDecimal(pendingGrant.InvestedSum));
+
+                if (pendingGrant.Campaign != null)
+                {
+                    var recommendation = new AddRecommendationDto
+                    {
+                        Amount = finalInvestmentAmount,
+                        IsGroupAccountBalance = true,
+                        IsRequestForInTransit = true,
+                        Campaign = pendingGrant.Campaign,
+                        User = pendingGrant.User,
+                        UserEmail = pendingGrant.User.Email,
+                        UserFullName = pendingGrant.User.FirstName + " " + pendingGrant.User.LastName,
+                        PendingGrants = pendingGrant
+                    };
+
+                    await new RecommendationsController(
+                        _context,
+                        _repository,
+                        _mapper,
+                        _httpContextAccessors,
+                        _emailQueue,
+                        _appSecrets)
+                        .Create(recommendation);
+                }
+                user.IsActive = true;
+                user.IsFreeUser = false;
+                await _context.SaveChangesAsync();
             }
-
-            if (months < 0)
+            else if (pendingGrantsData.Status == "Rejected")
             {
-                years--;
-                months += 12;
-            }
-
-            List<string> parts = new List<string>();
-            if (years > 0) parts.Add($"{years} year{(years > 1 ? "s" : "")}");
-            if (months > 0) parts.Add($"{months} month{(months > 1 ? "s" : "")}");
-            if (days > 0) parts.Add($"{days} day{(days > 1 ? "s" : "")}");
-
-            return parts.Count > 0 ? string.Join(", ", parts) : "0 days";
-        }
-
-        [HttpPut("update-pending-grant")]
-        public async Task<IActionResult> UpdatePendingGrant([FromBody] UpdatePendingGrantsDto pendingGrantsData)
-        {
-            try
-            {
-                var pendingGrant = await _context.PendingGrants
-                                                    .Include(p => p.Campaign)
-                                                    .Include(p => p.User)
-                                                    .FirstOrDefaultAsync(i => i.Id == pendingGrantsData.Id);
-                if (pendingGrant == null)
-                    return BadRequest(new { Success = false, Message = "Wrong pending grand id." });
-
-                pendingGrant.ModifiedDate = DateTime.Now;
-
-                string currentStatus = pendingGrant.status ?? "Pending";
-                decimal pendingGrandAmount = Convert.ToDecimal(pendingGrant.Amount);
-
-                var identity = HttpContext.User.Identity as ClaimsIdentity;
-                var loginUserId = identity?.Claims.FirstOrDefault(i => i.Type == "id")?.Value;
-                var loginUser = await _repository.UserAuthentication.GetUserById(loginUserId!);
-
-                if (pendingGrantsData.Status == "In Transit" && currentStatus == "Pending")
+                if (currentStatus == "In Transit")
                 {
                     var user = await _context.Users.FirstOrDefaultAsync(i => i.Email == pendingGrant.User.Email);
+
                     if (user == null)
-                        return BadRequest(new { Success = false, Message = "User not found." });
+                        return BadRequest(new { Success = false, Message = "User not found" });
 
-                    bool isFreeUser = user.IsFreeUser;
-                    decimal totalInvestmentCampaignFee = (pendingGrandAmount * 0.05m); //Investment Campaign Fee
-                    decimal amount = pendingGrandAmount - totalInvestmentCampaignFee;
+                    pendingGrant.status = "Rejected";
+                    pendingGrant.RejectedBy = loginUserId!;
+                    pendingGrant.RejectionMemo = pendingGrantsData.RejectionMemo.Trim();
+                    pendingGrant.RejectionDate = DateTime.Now;
 
-                    var groupAccountBalance = await _context.GroupAccountBalance
-                                                    .Include(gab => gab.Group)
-                                                    .Where(gab => gab.User.Id == user.Id)
-                                                    .OrderBy(gab => gab.Id)
-                                                    .ToListAsync();
-
-                    decimal totalGroupBalance = groupAccountBalance.Sum(gab => gab.Balance);
-                    decimal fromWallet = Convert.ToDecimal(pendingGrant.InvestedSum) - (pendingGrandAmount + totalGroupBalance);
-
-                    if (user.AccountBalance < fromWallet)
-                        return Ok(new { Success = false, Message = "User do not have sufficient wallet balance." });
-
-                    pendingGrant.status = "In Transit";
-
-                    await new UsersController(_context, _blobContainerClient, _repository, _mailService, _configuration, _mapper, _httpContextAccessors).
-                        UpdateAccountBalance(pendingGrant.User.Email, amount, pendingGrandAmount, pendingGrant.Reference, null, pendingGrant.Id);
-
-                    decimal totalAvailable = Convert.ToDecimal(user.AccountBalance + amount + totalGroupBalance);
-                    decimal finalInvestmentAmount = Math.Min(totalAvailable, Convert.ToDecimal(pendingGrant.InvestedSum));
-
-                    if (pendingGrant.Campaign != null)
+                    if (pendingGrant?.Campaign?.Id == null)
                     {
-                        var recommendation = new AddRecommendationDto
+                        var existingLog = await _context.AccountBalanceChangeLogs
+                                                .Include(x => x.PendingGrants)
+                                                .Where(x => x.UserId == pendingGrant!.UserId && x.PendingGrantsId == pendingGrant.Id)
+                                                .OrderByDescending(x => x.Id)
+                                                .FirstOrDefaultAsync();
+
+                        if (existingLog != null)
                         {
-                            Amount = finalInvestmentAmount,
-                            IsGroupAccountBalance = true,
-                            IsRequestForInTransit = true,
-                            Campaign = pendingGrant.Campaign,
-                            User = pendingGrant.User,
-                            UserEmail = pendingGrant.User.Email,
-                            UserFullName = pendingGrant.User.FirstName + " " + pendingGrant.User.LastName,
-                            PendingGrants = pendingGrant
-                        };
-
-                        await new RecommendationsController(_context, _repository, _mapper, _mailService, _httpContextAccessors).
-                            CreateRecommendation(recommendation);
-                    }
-
-                    if (_environment.EnvironmentName == "Production" && isFreeUser && !string.IsNullOrEmpty(user.KlaviyoProfileId))
-                    {
-                        await UpdateKlaviyoUserStatus(user.KlaviyoProfileId);
-                    }
-
-                    user.IsActive = true;
-                    user.IsFreeUser = false;
-                    await _context.SaveChangesAsync();
-                }
-                else if (pendingGrantsData.Status == "Rejected")
-                {
-                    if (currentStatus == "In Transit")
-                    {
-                        var user = await _context.Users.FirstOrDefaultAsync(i => i.Email == pendingGrant.User.Email);
-
-                        if (user == null)
-                            return BadRequest(new { Success = false, Message = "User not found" });
-
-                        pendingGrant.status = "Rejected";
-                        pendingGrant.RejectedBy = loginUserId!;
-                        pendingGrant.RejectionMemo = pendingGrantsData.RejectionMemo.Trim();
-                        pendingGrant.RejectionDate = DateTime.Now;
-
-                        if (pendingGrant?.Campaign?.Id == null)
-                        {
-                            var existingLog = await _context.AccountBalanceChangeLogs
-                                                    .Where(x => x.UserId == pendingGrant!.UserId && x.PendingGrantsId == pendingGrant.Id)
-                                                    .OrderByDescending(x => x.Id)
-                                                    .FirstOrDefaultAsync();
-
-                            if (existingLog?.NewValue <= user.AccountBalance)
-                            {
-                                await AccountBalanceChangeLog(user, -existingLog.NewValue.Value, $"Reverted Pending Grant, Pending Grant Id= {pendingGrant?.Id}", pendingGrant!.Id, existingLog.Reference);
-                                await _context.SaveChangesAsync();
-                            }
-                            else
-                            {
-                                return Ok(new { Success = false, Message = "User do not have sufficient wallet balance to revert the pending grant" });
-                            }
-                        }
-                        else
-                        {
-                            var recommendation = await _context.Recommendations.FirstOrDefaultAsync(x =>
-                                                            x.Campaign != null &&
-                                                            x.UserEmail == user.Email &&
-                                                            x.Campaign.Id == pendingGrant.Campaign.Id &&
-                                                            x.PendingGrantsId == pendingGrant.Id);
-
-                            var existingLog = await _context.AccountBalanceChangeLogs
-                                                    .Where(x => x.UserId == pendingGrant.UserId)
-                                                    .OrderByDescending(x => x.Id)
-                                                    .FirstOrDefaultAsync();
-
-                            if (existingLog != null)
-                            {
-                                decimal totalInvestmentCampaignFee = (pendingGrandAmount * 0.05m); //Investment Campaign Fee
-                                decimal amount = pendingGrandAmount - totalInvestmentCampaignFee;
-
-                                if (recommendation?.Status != "rejected")
-                                    await AccountBalanceChangeLog(user, recommendation?.Amount ?? 0, $"Reverted Recommendation Amount, Recommendation Id= {recommendation?.Id}", pendingGrant.Id, existingLog.Reference, recommendation?.Campaign?.Name);
-
-                                await AccountBalanceChangeLog(user, -amount, $"Reverted Pending Grant, Pending Grant Id= {pendingGrant.Id}", pendingGrant.Id, existingLog.Reference);
-                            }
-
-                            if (recommendation != null)
-                                recommendation.Status = "rejected";
-
+                            await AccountBalanceChangeLog(user, -existingLog!.PendingGrants!.AmountAfterFees!.Value, $"Pending grant reverted, id = {pendingGrant?.Id}", pendingGrant!.Id, existingLog.Reference);
                             await _context.SaveChangesAsync();
                         }
                     }
-                    else if (currentStatus == "Pending")
+                    else
                     {
-                        pendingGrant.status = "Rejected";
-                        pendingGrant.RejectedBy = loginUserId!;
-                        pendingGrant.RejectionMemo = pendingGrantsData.RejectionMemo.Trim();
-                        pendingGrant.RejectionDate = DateTime.Now;
+                        var recommendation = await _context.Recommendations.FirstOrDefaultAsync(x =>
+                                                        x.Campaign != null &&
+                                                        x.UserEmail == user.Email &&
+                                                        x.Campaign.Id == pendingGrant.Campaign.Id &&
+                                                        x.PendingGrantsId == pendingGrant.Id);
+
+                        var existingLog = await _context.AccountBalanceChangeLogs
+                                                .Where(x => x.UserId == pendingGrant.UserId)
+                                                .OrderByDescending(x => x.Id)
+                                                .FirstOrDefaultAsync();
+
+                        if (existingLog != null)
+                        {
+                            decimal amount = pendingGrant.AmountAfterFees ?? pendingGrandAmount - (pendingGrandAmount * 0.05m);
+
+                            if (recommendation?.Status != "rejected")
+                                await AccountBalanceChangeLog(user, recommendation?.Amount ?? 0, $"Recommendation reverted due to pending grant rollback, id = {recommendation?.Id}", pendingGrant.Id, existingLog.Reference, recommendation?.Campaign?.Name, recommendation?.Campaign?.Id);
+
+                            await AccountBalanceChangeLog(user, -amount, $"Pending grant reverted, id = {pendingGrant.Id}", pendingGrant.Id, existingLog.Reference);
+                        }
+
+                        if (recommendation != null)
+                            recommendation.Status = "rejected";
 
                         await _context.SaveChangesAsync();
                     }
                 }
-                else if (pendingGrantsData.Status == "Received" && currentStatus == "In Transit")
+                else if (currentStatus == "Pending")
                 {
-                    pendingGrant.status = "Received";
+                    pendingGrant.status = "Rejected";
+                    pendingGrant.RejectedBy = loginUserId!;
+                    pendingGrant.RejectionMemo = pendingGrantsData.RejectionMemo.Trim();
+                    pendingGrant.RejectionDate = DateTime.Now;
+
                     await _context.SaveChangesAsync();
                 }
-
-                return Ok(new
-                {
-                    Success = true,
-                    Message = $"Grant set {pendingGrantsData.Status}",
-                    Data = new
-                    {
-                        RejectedBy = loginUser.UserName.Trim().ToLower(),
-                        RejectionMemo = pendingGrant?.RejectionMemo
-                    }
-                });
             }
-            catch (Exception ex)
+            else if (pendingGrantsData.Status == "Received" && currentStatus == "In Transit")
             {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
+                pendingGrant.status = "Received";
+                await _context.SaveChangesAsync();
             }
+
+            return Ok(new
+            {
+                Success = true,
+                Message = $"Grant set {pendingGrantsData.Status}"
+            });
         }
 
         [HttpPost("create")]
+        [ModuleAuthorize(PermissionType.Manage)]
         public async Task<IActionResult> AddPendingGrants([FromBody] PendingGrantsDto pendingGrants)
         {
             if (pendingGrants == null)
-            {
                 return BadRequest(new { Success = false, Message = "Data type is invalid" });
-            }
             if (pendingGrants.Amount <= 0)
-            {
                 return BadRequest(new { Success = false, Message = "Amount must be greater than zero." });
+
+            var allEmailTasks = new List<Task>();
+
+            var requestOrigin = HttpContext?.Request.Headers["Origin"].ToString();
+
+            var email = pendingGrants?.Email ?? string.Empty;
+            bool isAnonymous = pendingGrants!.IsAnonymous;
+            decimal amount = pendingGrants.CoverFees ? pendingGrants.InvestmentAmountWithFees : pendingGrants.Amount;
+            decimal amountAfterFees = pendingGrants.CoverFees ? pendingGrants.Amount : amount - (amount * 0.05m);
+
+            if (isAnonymous)
+            {
+                var existingEmail = _context.Users.Where(u => u.Email.ToLower() == email.ToLower().Trim()).Any();
+                if (existingEmail)
+                    return Ok(new { Success = false, Message = $"Email '{email}' is already taken." });
             }
 
-            CommonResponse response = new();
-            try
+            var user = isAnonymous ? await RegisterAnonymousUser(pendingGrants!) : await GetUserFromContext(email);
+
+            if (pendingGrants!.Reference?.ToLower().Trim() == "catacap.org" || pendingGrants!.Reference?.ToLower().Trim() == "champions deals")
+                user.IsActive = true;
+
+            decimal investedAmount = pendingGrants?.InvestedSum > 0 ? Convert.ToDecimal(pendingGrants.InvestedSum) : (pendingGrants!.CoverFees ? pendingGrants.InvestmentAmountWithFees : pendingGrants!.Amount);
+            int? investmentId = !string.IsNullOrEmpty(pendingGrants.InvestmentId) ? Convert.ToInt32(pendingGrants.InvestmentId) : null;
+            var campaign = await _context.Campaigns.FirstOrDefaultAsync(i => i.Id == investmentId);
+            var investmentName = campaign?.Name;
+
+            var addressObj = new
             {
-                var allEmailTasks = new List<Task>();
+                pendingGrants.Address?.Street,
+                pendingGrants.Address?.City,
+                pendingGrants.Address?.State,
+                pendingGrants.Address?.Country,
+                pendingGrants.Address?.ZipCode
+            };
+            var addressJson = JsonSerializer.Serialize(addressObj);
 
-                var requestOrigin = HttpContext?.Request.Headers["Origin"].ToString();
-                string adminEmail = _keyVaultConfigService.GetAdminEmail();
+            if (string.IsNullOrWhiteSpace(user.ZipCode))
+                user.ZipCode = addressObj.ZipCode;
 
-                var email = pendingGrants?.Email ?? string.Empty;
-                bool isAnonymous = pendingGrants!.IsAnonymous;
-                decimal amount = Convert.ToDecimal(pendingGrants?.Amount);
-                decimal amountAfterFees = amount - (amount * 0.05m);
+            var pendingGrant = new PendingGrants
+            {
+                UserId = user.Id,
+                Amount = amount.ToString(),
+                GrantAmount = amount,
+                AmountAfterFees = amountAfterFees,
+                DAFProvider = pendingGrants.DAFProvider,
+                DAFName = !string.IsNullOrWhiteSpace(pendingGrants.DAFName) ? pendingGrants.DAFName : null,
+                Campaign = campaign,
+                InvestedSum = investedAmount.ToString(),
+                TotalInvestedAmount = investedAmount,
+                status = "Pending",
+                Reference = !string.IsNullOrWhiteSpace(pendingGrants.Reference) ? pendingGrants.Reference : null,
+                CreatedDate = DateTime.Now,
+                ModifiedDate = DateTime.Now,
+                Address = addressJson
+            };
+            await _context.PendingGrants.AddAsync(pendingGrant);
+            await _context.SaveChangesAsync();
 
-                if (isAnonymous)
+            string? dafProviderURL = null;
+
+            if (!string.IsNullOrWhiteSpace(pendingGrant.DAFProvider))
+            {
+                string? dafProvider = pendingGrant.DAFProvider.Trim().ToLowerInvariant();
+
+                dafProviderURL = await _context.DAFProviders
+                                                .Where(x => x.ProviderName != null
+                                                            && x.IsActive
+                                                            && x.ProviderName.ToLower().Trim() == dafProvider)
+                                                .Select(x => x.ProviderURL)
+                                                .FirstOrDefaultAsync();
+            }
+
+            string formattedAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", amount);
+
+            var commonVariables = new Dictionary<string, string>
+            {
+                { "firstName", user.FirstName! },
+                { "siteUrl", _appSecrets.RequestOrigin }
+            };
+
+            if (isAnonymous)
+            {
+                var welcomeVariables = new Dictionary<string, string>(commonVariables)
                 {
-                    var existingEmail = _context.Users.Where(u => u.Email.ToLower() == email.ToLower().Trim()).Any();
-                    if (existingEmail)
-                    {
-                        response.Success = false;
-                        response.Message = $"Email '{email}' is already taken.";
-                        return Ok(response);
-                    }
-                }
-
-                var user = isAnonymous ? await RegisterAnonymousUser(pendingGrants!) : await GetUserFromContext(email);
-
-                if (!string.IsNullOrEmpty(pendingGrants!.Reference))
-                    user.IsActive = true;
-
-                decimal investedAmount = pendingGrants?.InvestedSum > 0 ? Convert.ToDecimal(pendingGrants.InvestedSum) : Convert.ToDecimal(pendingGrants!.Amount);
-                int? investmentId = !string.IsNullOrEmpty(pendingGrants.InvestmentId) ? Convert.ToInt32(pendingGrants.InvestmentId) : null;
-                var campaign = await _context.Campaigns.FirstOrDefaultAsync(i => i.Id == investmentId);
-                var investmentName = campaign?.Name;
-
-                var pendingGrant = new PendingGrants
-                {
-                    UserId = user.Id,
-                    Amount = amount.ToString(),
-                    AmountAfterFees = amountAfterFees,
-                    DAFProvider = pendingGrants.DAFProvider,
-                    DAFName = pendingGrants.DAFName,
-                    Campaign = campaign,
-                    InvestedSum = investedAmount.ToString(),
-                    status = "Pending",
-                    Reference = !string.IsNullOrWhiteSpace(pendingGrants.Reference) ? pendingGrants.Reference : null,
-                    CreatedDate = DateTime.Now,
-                    ModifiedDate = DateTime.Now
+                    { "userName", user.UserName },
+                    { "resetPasswordUrl", $"{_appSecrets.RequestOrigin}/forgotpassword" }
                 };
-                await _context.PendingGrants.AddAsync(pendingGrant);
-                await _context.SaveChangesAsync();
 
-                string? dafProviderURL = null;
-
-                if (!string.IsNullOrWhiteSpace(pendingGrant.DAFProvider))
+                _emailQueue.QueueEmail(async (sp) =>
                 {
-                    string? dafProvider = pendingGrant.DAFProvider.Trim().ToLowerInvariant();
+                    var emailService = sp.GetRequiredService<IEmailTemplateService>();
 
-                    dafProviderURL = await _context.DAFProviders
-                                                    .Where(x => x.ProviderName != null
-                                                                && x.IsActive
-                                                                && x.ProviderName.ToLower().Trim() == dafProvider)
-                                                    .Select(x => x.ProviderURL)
-                                                    .FirstOrDefaultAsync();
-                }
-
-                _ = Task.Run(async () =>
-                {
-                    string email = user.Email;
-                    string? userName = user.UserName;
-                    string? firstName = user.FirstName;
-                    string? lastName = user.LastName;
-
-                    if (isAnonymous)
-                    {
-                        allEmailTasks.Add(SendWelcomeEmail(requestOrigin!, email, userName, firstName!));
-                    }
-
-                    if (user?.OptOutEmailNotifications == null || !(bool)user.OptOutEmailNotifications)
-                    {
-                        allEmailTasks.Add(pendingGrants.DAFProvider == "foundation grant"
-                                            ? SendFoundationEmail(requestOrigin!, investmentName!, investedAmount, email, firstName!)
-                                            : SendDAFEmail(requestOrigin!, email, firstName!, dafProviderURL, pendingGrants.DAFProvider, investedAmount, investmentName!));
-                    }
-
-                    string paymentMethod = pendingGrants.DAFProvider == "foundation grant"
-                                            ? "Foundation Grant"
-                                            : !string.IsNullOrEmpty(pendingGrants.DAFName)
-                                                ? $"{pendingGrants.DAFProvider} - {pendingGrants.DAFName}"
-                                                : pendingGrants.DAFProvider ?? string.Empty;
-
-                    allEmailTasks.Add(SendPendingGrantEmailToAdmin(adminEmail, amount, firstName!, lastName!, paymentMethod));
-
-                    await Task.WhenAll(allEmailTasks);
+                    await emailService.SendTemplateEmailAsync(
+                        EmailTemplateCategory.WelcomeAnonymousUser,
+                        email,
+                        welcomeVariables
+                    );
                 });
+            }
 
-                response.Success = true;
-                response.Message = "Grant created successful.";
-                return Ok(response);
-            }
-            catch (Exception ex)
+            if (user?.OptOutEmailNotifications == null || !(bool)user.OptOutEmailNotifications)
             {
-                response.Success = false;
-                response.Message = $"An error occurred: {ex.Message}";
-                return BadRequest(response);
+                if (pendingGrants.DAFProvider == "foundation grant")
+                {
+                    string investmentScenarios = !string.IsNullOrEmpty(investmentName)
+                                                    ? $"to invest in {investmentName} through investment"
+                                                    : "through investment";
+
+                    var foundationVariables = new Dictionary<string, string>(commonVariables)
+                    {
+                        { "formattedAmount", formattedAmount },
+                        { "investmentScenarios", investmentScenarios }
+                    };
+
+                    _emailQueue.QueueEmail(async (sp) =>
+                    {
+                        var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                        await emailService.SendTemplateEmailAsync(
+                            EmailTemplateCategory.FoundationDonationInstructions,
+                            email,
+                            foundationVariables
+                        );
+                    });
+                }
+                else
+                {
+                    string investmentScenario = !string.IsNullOrEmpty(investmentName)
+                                                ? $"to support <b>{investmentName}</b> through CataCap"
+                                                : "through CataCap";
+
+                    var dafProviderLink = !string.IsNullOrEmpty(dafProviderURL)
+                                            ? $@"<a href='{dafProviderURL}' target='_blank'>{pendingGrants.DAFProvider}</a>"
+                                            : pendingGrants.DAFProvider;
+
+                    string donationRecipient = pendingGrants.DAFProvider == "DAFgiving360: Charles Schwab" ? "CataCap" : "Impactree Foundation";
+
+                    var dafVariables = new Dictionary<string, string>(commonVariables)
+                    {
+                        { "formattedAmount", formattedAmount },
+                        { "investmentScenario", investmentScenario },
+                        { "dafProviderName", pendingGrants.DAFProvider },
+                        { "dafProviderLink", dafProviderLink },
+                        { "donationRecipient", donationRecipient }
+                    };
+
+                    _emailQueue.QueueEmail(async (sp) =>
+                    {
+                        var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                        EmailTemplateCategory templateCategory =
+                            pendingGrants.DAFProvider == "ImpactAssets"
+                                ? EmailTemplateCategory.DAFDonationInstructionsImpactAssets
+                                : EmailTemplateCategory.DAFDonationInstructions;
+
+                        await emailService.SendTemplateEmailAsync(
+                            templateCategory,
+                            email,
+                            dafVariables
+                        );
+                    });
+                }
             }
+
+            string paymentMethod = pendingGrants.DAFProvider == "foundation grant"
+                                        ? "Foundation Grant"
+                                        : !string.IsNullOrEmpty(pendingGrants.DAFName)
+                                            ? $"{pendingGrants.DAFProvider} - {pendingGrants.DAFName}"
+                                            : pendingGrants.DAFProvider ?? string.Empty;
+
+            var variables = new Dictionary<string, string>
+            {
+                { "formattedAmount", formattedAmount },
+                { "firstName", user!.FirstName! },
+                { "lastName", user.LastName! },
+                { "paymentMethod", paymentMethod }
+            };
+
+            _emailQueue.QueueEmail(async (sp) =>
+            {
+                var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                await emailService.SendTemplateEmailAsync(
+                    EmailTemplateCategory.PendingGrantNotification,
+                    _appSecrets.AdminEmail,
+                    variables
+                );
+            });
+
+            return Ok(new { Success = true, Message = "Grant created successful." });
         }
 
-        [HttpGet("Export")]
+        [HttpGet("export")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<IActionResult> ExportPendingGrants()
         {
             var data = await _context.PendingGrants
                                         .Include(i => i.Campaign)
                                         .Include(i => i.User)
-                                        .Include(i => i.RejectedByUser)
                                         .OrderByDescending(i => i.Id)
                                         .ToListAsync();
 
@@ -528,7 +603,7 @@ namespace Investment.Controllers
                 var headers = new[]
                 {
                     "Full Name", "Email", "Original Amount", "Amount After Fees", "DAF Provider", "DAF Name",
-                    "Investment Name", "Grant Source", "Status", "Date Created", "Rejection Memo", "Rejected By", "Rejection Date", "Day Count"
+                    "Investment Name", "Grant Source", "Status", "Address", "Date Created", "Day Count"
                 };
 
                 for (int col = 0; col < headers.Length; col++)
@@ -563,13 +638,8 @@ namespace Investment.Controllers
                     worksheet.Cell(row, col++).Value = dto.Campaign?.Name;
                     worksheet.Cell(row, col++).Value = dto.Reference;
                     worksheet.Cell(row, col++).Value = string.IsNullOrEmpty(dto.status) ? "Pending" : dto.status;
+                    worksheet.Cell(row, col++).Value = dto.Address;
                     worksheet.Cell(row, col++).Value = dto.CreatedDate?.ToString("MM-dd-yyyy HH:mm");
-                    worksheet.Cell(row, col++).Value = dto.RejectionMemo;
-                    worksheet.Cell(row, col++).Value = dto.RejectedByUser?.FirstName != null ? dto.RejectedByUser?.FirstName : null;
-
-                    var rejectionDateCell = worksheet.Cell(row, col++);
-                    rejectionDateCell.Value = dto.RejectionDate;
-                    rejectionDateCell.Style.DateFormat.Format = "MM/dd/yyyy";
 
                     var createdDateCell = worksheet.Cell(row, col++);
                     if (string.IsNullOrEmpty(dto.status) || dto.status.ToLower() == "pending")
@@ -598,9 +668,125 @@ namespace Investment.Controllers
             }
         }
 
+        private async Task<(bool Success, string Message)> UpdateAccountBalance(string email, decimal accountBalance, decimal originalAmount, decimal totalCataCapFee, string grantType, int pendingGrantsId, decimal totalInvestmentAmount, string? reference = null, string? investmentName = null, string? zipCode = null)
+        {
+            var user = await _context.Users.FirstOrDefaultAsync(i => i.Email == email);
+
+            if (user?.AccountBalance + accountBalance < 0)
+                return (false, "Insufficient balance in user account.");
+
+            var identity = HttpContext?.User.Identity as ClaimsIdentity == null ? _httpContextAccessors.HttpContext?.User.Identity as ClaimsIdentity : HttpContext.User.Identity as ClaimsIdentity;
+            var loginUserId = identity?.Claims.FirstOrDefault(i => i.Type == "id")?.Value;
+            var loginUser = await _repository.UserAuthentication.GetUserById(loginUserId!);
+
+            var accountBalanceChangeLog = new AccountBalanceChangeLog
+            {
+                UserId = user!.Id,
+                PaymentType = string.IsNullOrWhiteSpace(grantType)
+                                ? $"Manually, {loginUser.UserName.Trim().ToLower()}"
+                                : $"{grantType}, {loginUser.UserName.Trim().ToLower()}",
+                OldValue = user.AccountBalance,
+                UserName = user.UserName,
+                NewValue = user.AccountBalance + accountBalance,
+                PendingGrantsId = pendingGrantsId,
+                Fees = totalCataCapFee,
+                GrossAmount = originalAmount,
+                NetAmount = accountBalance,
+                Reference = !string.IsNullOrWhiteSpace(reference) ? reference.Trim() : null,
+                ZipCode = !string.IsNullOrWhiteSpace(zipCode) ? zipCode.Trim() : null,
+            };
+            await _context.AccountBalanceChangeLogs.AddAsync(accountBalanceChangeLog);
+
+            if (user.IsFreeUser == true)
+                user.IsFreeUser = false;
+
+            user.AccountBalance = user.AccountBalance == null ? accountBalance : user.AccountBalance + accountBalance;
+
+            await _context.SaveChangesAsync();
+
+            if (user.OptOutEmailNotifications == null || !user.OptOutEmailNotifications.Value)
+            {
+                var request = _httpContextAccessors.HttpContext?.Request.Headers["Origin"].ToString();
+
+                decimal newValue = accountBalanceChangeLog.NewValue ?? 0m;
+                decimal userBalance = user.AccountBalance ?? 0m;
+                decimal amountAfterInvestment = newValue - Math.Min(userBalance, totalInvestmentAmount);
+                decimal investmentAmount;
+
+                if (newValue > userBalance!)
+                    investmentAmount = newValue;
+                else if (newValue < totalInvestmentAmount)
+                    investmentAmount = newValue;
+                else
+                    investmentAmount = originalAmount;
+
+                if (accountBalance > 0 && originalAmount > 0)
+                {
+                    string formattedOriginalAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", Convert.ToDecimal(originalAmount));
+                    string formattedOriginalAmountAfter = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", Convert.ToDecimal(accountBalance));
+                    string formattedInvestmentAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", Convert.ToDecimal(investmentAmount));
+                    string formattedAmountAfterInvestment = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", Convert.ToDecimal(amountAfterInvestment));
+
+                    string investmentScenario = !string.IsNullOrEmpty(investmentName)
+                                                ? $"Based on your investment of <b>{formattedInvestmentAmount}</b> in <b>{investmentName}</b>, your remaining balance is <b>{formattedAmountAfterInvestment}</b>"
+                                                : "";
+
+                    var variables = new Dictionary<string, string>
+                    {
+                        { "firstName", user.FirstName! },
+                        { "originalAmount", formattedOriginalAmount },
+                        { "originalAmountAfter", formattedOriginalAmountAfter },
+                        { "investmentScenario", investmentScenario },
+                        { "browseOpportunitiesUrl", $"{_appSecrets.RequestOrigin}/investments" },
+                        { "unsubscribeUrl", $"{_appSecrets.RequestOrigin}/settings" }
+                    };
+
+                    _emailQueue.QueueEmail(async (sp) =>
+                    {
+                        var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                        await emailService.SendTemplateEmailAsync(
+                            EmailTemplateCategory.GrantReceived,
+                            user.Email,
+                            variables
+                        );
+                    });
+                }
+            }
+
+            return (true, "Account balance has been updated successfully!");
+        }
+
+        private static string GetReadableDuration(DateTime from, DateTime to)
+        {
+            int years = to.Year - from.Year;
+            int months = to.Month - from.Month;
+            int days = to.Day - from.Day;
+
+            if (days < 0)
+            {
+                months--;
+                days += DateTime.DaysInMonth(from.Year, from.Month);
+            }
+
+            if (months < 0)
+            {
+                years--;
+                months += 12;
+            }
+
+            List<string> parts = new List<string>();
+            if (years > 0) parts.Add($"{years} year{(years > 1 ? "s" : "")}");
+            if (months > 0) parts.Add($"{months} month{(months > 1 ? "s" : "")}");
+            if (days > 0) parts.Add($"{days} day{(days > 1 ? "s" : "")}");
+
+            return parts.Count > 0 ? string.Join(", ", parts) : "0 days";
+        }
+
         private async Task<User> RegisterAnonymousUser(PendingGrantsDto dto)
         {
-            var userName = $"{dto.FirstName}{dto.LastName}".Trim().ToLower();
+
+            var userName = $"{dto.FirstName}{dto.LastName}".Replace(" ", "").Trim().ToLower();
             Random random = new Random();
             while (_context.Users.Any(x => x.UserName == userName))
             {
@@ -612,7 +798,7 @@ namespace Investment.Controllers
                 FirstName = dto.FirstName,
                 LastName = dto.LastName,
                 UserName = userName,
-                Password = defaultPassword,
+                Password = _appSecrets.DefaultPassword,
                 Email = dto.Email
             };
 
@@ -620,13 +806,6 @@ namespace Investment.Controllers
 
             var user = await _repository.UserAuthentication.GetUserByUserName(userName);
             user.IsFreeUser = true;
-
-            if (_environment.EnvironmentName == "Production")
-            {
-                var profileId = await CreateKlaviyoProfile(user);
-                if (!string.IsNullOrEmpty(profileId))
-                    user.KlaviyoProfileId = profileId;
-            }
             await _repository.UserAuthentication.UpdateUser(user);
             await _repository.SaveAsync();
 
@@ -638,95 +817,12 @@ namespace Investment.Controllers
             var identity = _httpContextAccessors.HttpContext?.User.Identity as ClaimsIdentity;
             var userId = identity?.Claims.FirstOrDefault(i => i.Type == "id")?.Value;
             if (!string.IsNullOrEmpty(userId))
-            {
                 return await _repository.UserAuthentication.GetUserById(userId);
-            }
             else
-            {
                 return await _repository.UserAuthentication.GetUserByEmail(email);
-            }
         }
 
-        private async Task<string?> CreateKlaviyoProfile(User user)
-        {
-            string klaviyoApiKey = _keyVaultConfigService.GetKlaviyoApiKey();
-            string klaviyoListKey = _keyVaultConfigService.GetKlaviyoListKey();
-
-            _httpClient.DefaultRequestHeaders.Clear();
-            _httpClient.DefaultRequestHeaders.Add("Authorization", $"Klaviyo-API-Key {klaviyoApiKey}");
-            _httpClient.DefaultRequestHeaders.Add("revision", "2024-05-15");
-
-            var payload = new
-            {
-                data = new
-                {
-                    type = "profile",
-                    attributes = new
-                    {
-                        email = user.Email,
-                        first_name = user.FirstName,
-                        last_name = user.LastName,
-                        properties = new
-                        {
-                            isFreeUser = true,
-                            name = $"{user.FirstName} {user.LastName}"
-                        }
-                    }
-                }
-            };
-
-            var json = JsonSerializer.Serialize(payload);
-            var content = new StringContent(json, Encoding.UTF8, "application/json");
-            var klaviyoResponse = await _httpClient.PostAsync("https://a.klaviyo.com/api/profiles/", content);
-
-            if (!klaviyoResponse.IsSuccessStatusCode)
-                return null;
-
-            var responseContent = await klaviyoResponse.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(responseContent);
-            var profileId = doc.RootElement.GetProperty("data").GetProperty("id").GetString();
-
-            var listPayload = new
-            {
-                data = new[]
-                {
-                    new { type = "profile", id = profileId }
-                }
-            };
-            var listJson = JsonSerializer.Serialize(listPayload);
-            var listContent = new StringContent(listJson, Encoding.UTF8, "application/json");
-            string url = $"https://a.klaviyo.com/api/lists/{klaviyoListKey}/relationships/profiles/";
-
-            await _httpClient.PostAsync(url, listContent);
-            return profileId;
-        }
-
-        private async Task UpdateKlaviyoUserStatus(string klaviyoId)
-        {
-            string apiKey = _keyVaultConfigService.GetKlaviyoApiKey();
-
-            _httpClient.DefaultRequestHeaders.Clear();
-            _httpClient.DefaultRequestHeaders.Add("Authorization", $"Klaviyo-API-Key {apiKey}");
-            _httpClient.DefaultRequestHeaders.Add("revision", "2024-05-15");
-
-            var payload = new
-            {
-                data = new
-                {
-                    type = "profile",
-                    id = klaviyoId,
-                    attributes = new
-                    {
-                        properties = new { isFreeUser = false }
-                    }
-                }
-            };
-
-            var content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-            await _httpClient.PatchAsync($"https://a.klaviyo.com/api/profiles/{klaviyoId}/", content);
-        }
-
-        private async Task AccountBalanceChangeLog(User user, decimal amount, string type, int pendingGrandId, string? reference = null, string? investmentName = null)
+        private async Task AccountBalanceChangeLog(User user, decimal amount, string type, int pendingGrandId, string? reference = null, string? investmentName = null, int? campaignId = null)
         {
             var log = new AccountBalanceChangeLog
             {
@@ -737,178 +833,12 @@ namespace Investment.Controllers
                 NewValue = user.AccountBalance + amount,
                 PendingGrantsId = pendingGrandId,
                 Reference = !string.IsNullOrWhiteSpace(reference) ? reference : null,
-                InvestmentName = investmentName
+                InvestmentName = investmentName,
+                CampaignId = campaignId
             };
 
             await _context.AccountBalanceChangeLogs.AddAsync(log);
             user.AccountBalance = log.NewValue;
-        }
-
-        private async Task SendDAFEmail(string request, string email, string firstName, string? dafProviderURL, string dafProviderName, decimal amount, string investmentName)
-        {
-            string logoUrl = $"{request}/logo-for-email.png";
-            string logoHtml = $@"
-                                <div style='text-align: center;'>
-                                    <a href='https://investment-campaign.org' target='_blank'>
-                                        <img src='{logoUrl}' alt='Logo' width='300' height='150' />
-                                    </a>
-                                </div>";
-
-            string formattedAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", amount);
-
-            string investmentScenarios = !string.IsNullOrEmpty(investmentName)
-                                            ? $"to support <b>{investmentName}</b> through Investment Campaign"
-                                            : "through Investment Campaign";
-
-            var dafLinkScenarios = !string.IsNullOrEmpty(dafProviderURL)
-                                        ? $@"<a href='{dafProviderURL}' target='_blank'>{dafProviderName}</a>"
-                                        : dafProviderName;
-
-            var subject = "Thank You for Your Commitment – Next Steps for Your DAF Donation";
-            var body = logoHtml + @$"
-                                <p><b>Hi {firstName},</b></p>
-                                <p>Thank you for your generous <b>{formattedAmount}</b> commitment {investmentScenarios}!.🙌</p>  
-                                <p>We’re thrilled to have you on this journey of catalytic impact.</p>
-                                <p>Since you’re donating through your <b>Donor-Advised Fund (DAF)</b> — in this case, <b>{dafProviderName}</b> — here’s how to complete your grant:</p>
-                                <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>                             
-                                <p><div style='font-size: 20px;'><b>✅ How to Make Your Donation</b></div></p>
-                                <ol>
-                                    <li><b>Log in </b>to your {dafLinkScenarios} account.</li>
-                                    <li><b>Initiate a grant </b>using the following details:</li>
-                                    <ul style='list-style-type:disc;'>
-                                        <li><b>Donation Recipient:</b> Investment Campaign Foundation</li>
-                                        <li><b>Amount:</b> {formattedAmount}</li>
-                                        <li><b>EIN:</b> 86-2370923</li>
-                                        <li><b>Email:</b> <a href='mailto:investment.campaign@mailinator.com'>investment.campaign@mailinator.com</a></li>
-                                        <li><b>Address:</b> 213 West 85th Street, New York, NY 10024</li>
-                                    </ul>
-                                    <li><b>Forward your confirmation</b> email to <b><a href='mailto:investment.campaign@mailinator.com'>investment.campaign@mailinator.com</a></b> so we can apply your investment as soon as possible.</li>
-                                </ol>
-                                <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>
-                                <p>Your contribution helps move capital to where it’s most needed — thank you for being a part of this powerful movement. We’re honored to work alongside you to fund bold solutions for a better world.</p>
-                                <p style='margin-bottom: 0px;'>Let’s get your capital to work.🚀</p>
-                                <p style='margin-bottom: 0px; margin-top: 0px;'>Warmly,</p>
-                                <p style='margin-bottom: 0px; margin-top: 0px;'><b>Shabbir Bharmal + The Investment Campaign Team</b></p>
-                                <p style='margin-bottom: 0px; margin-top: 0px;'>Powered by the Investment Campaign</p>
-                                <p style='margin-bottom: 0px; margin-top: 0px;'>🌐 <a href='https://investment-campaign.org/'>investment-campaign.org</a> | 💼 <a href='https://www.linkedin.com/company/investment-campaign-us/'>Follow us on LinkedIn</a></p>
-                                <p style='margin-top: 0px;'><a href='{request}/settings' target='_blank'>Unsubscribe</a> from Investment Campaign notifications.</p>
-                                ";
-
-            await _mailService.SendMailAsync(email, subject, "", body);
-        }
-
-        private async Task SendFoundationEmail(string request, string investmentName, decimal amount, string email, string firstName)
-        {
-            string logoUrl = $"{request}/logo-for-email.png";
-            string logoHtml = $@"
-                                <div style='text-align: center;'>
-                                    <a href='https://investment-campaign.org' target='_blank'>
-                                        <img src='{logoUrl}' alt='Logo' width='300' height='150' />
-                                    </a>
-                                </div>";
-
-            string formattedAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", amount);
-
-            string investmentScenarios = !string.IsNullOrEmpty(investmentName)
-                                            ? $"to invest in {investmentName} through Investment Campaign"
-                                            : "through Investment Campaign";
-
-            var subject = $"You're In! Next Step to Complete Your {formattedAmount} Commitment to Foundation Grant";
-            var body = logoHtml + @$"
-                                <p><b>Hi {firstName},</b></p>
-                                <p>Thank you for your generous <b>{formattedAmount} commitment </b> {investmentScenarios}.</p>  
-                                <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>
-                                <p><div style='font-size: 20px;'><b>✅ How to Make Your Donation</b></div></p>
-                                <ol>
-                                    <li><b>Initiate a grant </b>to the following recipient:</li>
-                                    <ul style='list-style-type:disc;'>
-                                        <li><b>Donation Recipient:</b> Investment Campaign</li>
-                                        <li><b>Amount:</b> {formattedAmount}</li>
-                                        <li><b>EIN:</b> 86-2370923</li>
-                                        <li><b>Email:</b> <a href='mailto:investment.campaign@mailinator.com'>investment.campaign@mailinator.com</a></li>
-                                        <li><b>Address:</b> 213 West 85th Street, New York, NY 10024</li>
-                                    </ul>
-                                    <li><b>Forward confirmation:</b></li>
-                                    <p style='margin-top: 0px;'>Once your grant is submitted, please forward the confirmation email to <a href='mailto:investment.campaign@mailinator.com'>investment.campaign@mailinator.com</a> so we can apply your investment immediately.</p>
-                                </ol>
-                                <div style='margin-bottom: 20px; margin-top: 20px;'><hr></div>
-                                <p>We’re honored to partner with you in moving catalytic capital to where it can make the greatest difference. Thank you for helping fund what the world truly needs.</p>
-                                <p style='margin-bottom: 0px;'><b>Let’s get your capital to work.</b></p>
-                                <p style='margin-bottom: 0px; margin-top: 0px;'>Warmly,</p>
-                                <p style='margin-bottom: 0px; margin-top: 0px;'>Shabbir Bharmal + The Investment Campaign Team</p>
-                                <p style='margin-top: 0px;'><i>Powered by the Investment Campaign</i></p>
-                                <p>🌍 <a href='https://investment-campaign.org/'>investment-campaign.org</a> | 💼 <a href='https://www.linkedin.com/company/investment-campaign-us/'>Follow us on LinkedIn</a></p>
-                                <p><a href='{request}/settings' target='_blank'>Unsubscribe</a> from Investment Campaign notifications.</p>
-                                ";
-
-            await _mailService.SendMailAsync(email, subject, "", body);
-        }
-
-        private async Task SendWelcomeEmail(string request, string emailTo, string userName, string firstName)
-        {
-            string logoUrl = $"{request}/logo-for-email.png";
-            string logoHtml = $@"
-                                <div style='text-align: center;'>
-                                    <a href='https://investment-campaign.org' target='_blank'>
-                                        <img src='{logoUrl}' alt='Logo' width='300' height='150' />
-                                    </a>
-                                </div>";
-
-            string resetPasswordUrl = $"{request}/forgot-password";
-            string userSettingsUrl = $"{request}/settings";
-            string subject = "Welcome to Investment Campaign - Let’s Move Capital That Matters 💥";
-
-            var body = logoHtml + $@"
-                                    <html>
-                                        <body>
-                                            <p><b>Hi {firstName},</b></p>
-                                            <p>Welcome to <b>Investment Campaign</b> - the movement turning philanthropic dollars into <b>powerful, catalytic investments</b> that fuel real change.</p>
-                                            <p>You’ve just joined what we believe will become the <b>largest community of catalytic capital champions</b> on the planet. Whether you're a donor, funder, or impact-curious investor - you're in the right place.</p>
-                                            <p>Your Investment Campaign username: <b>{userName}</b></p>
-                                            <p>To set your password: <a href='{resetPasswordUrl}' target='_blank'>Click here</a></p>
-                                            <p>Here’s what you can do right now on Investment Campaign:</p>
-                                            <p>🔎 <b>1. Discover Investments Aligned with Your Values</b></p>
-                                            <p style='margin-bottom: 0px;'>Use your <b>DAF, foundation, or donation capital</b> to fund vetted companies, VC funds, and loan structures — not just nonprofits.</p>
-                                            <p style='margin-top: 0px;'>➡️ <a href='{request}/find'>Browse live investment opportunities</a></p>
-                                            <p>🤝 <b>2. Connect with Like-Minded Peers</b></p>
-                                            <p style='margin-bottom: 0px;'>Follow friends and colleagues, share opportunities, or keep your giving private — you’re in control.</p>
-                                            <p style='margin-top: 0px;'>➡️ <a href='{request}/community'>Explore the Investment Campaign community</a></p>
-                                            <p>🗣️ <b>3. Join or Start a Group</b></p>
-                                            <p style='margin-bottom: 0px;'>Find (or create!) groups around shared causes and funding themes — amplify what matters to you.</p>
-                                            <p style='margin-top: 0px;'>➡️ <a href='{request}/community'>See active groups and start your own</a></p>
-                                            <p>🚀 <b>4. Recommend Deals You Believe In</b></p>
-                                            <p style='margin-bottom: 0px;'>Champion investments that should be seen — and funded — by others in the community.</p>
-                                            <p style='margin-top: 0px;'>➡️ <a href='https://investment-campaign.org/lead-investor/'>Propose an opportunity</a></p>
-                                            <p>We’re here to help you put your capital to work — boldly, effectively, and in community.</p>
-                                            <p>Thanks for joining us. Let’s fund what we wish existed — together.</p>
-                                            <p style='margin-bottom: 0px;'><b>The Investment Campaign Team</b></p>
-                                            <p style='margin-top: 0px;'>🌍 <a href='https://investment-campaign.org/'>investment-campaign.org</a> | 💼 <a href='https://www.linkedin.com/company/investment-campaign-us/'>Follow us on LinkedIn</a></p>
-                                            <p>Have questions? Email Ken at <a href='mailto:investment.campaign@mailinator.com'>investment.campaign@mailinator.com</a></p>
-                                            <p><a href='{request}/settings' target='_blank'>Unsubscribe</a> from Investment Campaign notifications.</p>
-                                        </body>
-                                    </html>";
-
-            await _mailService.SendMailAsync(emailTo, subject, "", body);
-        }
-
-        private async Task SendPendingGrantEmailToAdmin(string adminEmail, decimal amount, string firstName, string lastName, string paymentMethod)
-        {
-            string formattedAmount = string.Format(System.Globalization.CultureInfo.GetCultureInfo("en-US"), "${0:N2}", amount);
-            string subject = "New pending grant on production";
-
-            var body = $@"
-                        <html>
-                            <body>
-                                Hello Team!<br/>
-                                We have a new pending grant on Production:<br/><br/>
-                                <b>Amount:</b> {formattedAmount}<br/>
-                                <b>Name:</b> {firstName} {lastName}<br/>
-                                <b>Method of payment:</b> {paymentMethod}</p><br/>
-                                Thanks!
-                            </body>
-                        </html>";
-
-            await _mailService.SendMailAsync(adminEmail, subject, "", body);
         }
     }
 }

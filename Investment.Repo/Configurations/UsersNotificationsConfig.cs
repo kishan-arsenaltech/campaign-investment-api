@@ -9,6 +9,7 @@ namespace Investment.Repo.Configurations
         public void Configure(EntityTypeBuilder<UsersNotification> builder)
         {
             builder.HasOne(i => i.TargetUser).WithMany(i => i.Notifications);
+            builder.HasOne(x => x.DeletedByUser).WithMany().HasForeignKey(x => x.DeletedBy);
         }
     }
 }

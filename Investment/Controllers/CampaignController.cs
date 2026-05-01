@@ -8,29 +8,35 @@ using Azure.Storage.Blobs.Models;
 using Azure.Storage.Blobs.Specialized;
 using Azure.Storage.Sas;
 using ClosedXML.Excel;
+using Invest.Authorization.Enums;
+using Invest.Core.Constants;
+using Invest.Core.Entities;
+using Invest.Core.Settings;
+using Investment.Authorization.Attributes;
+using Investment.Authorization.Enums;
+using Investment.Core.Constants;
 using Investment.Core.Dtos;
-using Investment.Extensions;
+using Investment.Core.Entities;
+using Investment.Core.Extensions;
 using Investment.Repo.Context;
-using Microsoft.AspNetCore.Authorization;
+using Investment.Service.Interfaces;
+using Investment.Service.Services;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using QRCoder;
 using System.ComponentModel;
 using System.Data;
 using System.Dynamic;
 using System.Globalization;
 using System.IO.Compression;
 using System.Security.Claims;
-using System.Text;
 using System.Text.Json;
-using Investment.Service.Interfaces;
-using Investment.Core.Entities;
-using QRCoder;
-using Invest.Core.Entities;
 
 namespace Invest.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
+    [Module(Modules.Investment)]
     public class CampaignController : ControllerBase
     {
         private readonly RepositoryContext _context;
@@ -39,12 +45,12 @@ namespace Invest.Controllers
         private readonly IMailService _mailService;
         private readonly IRepositoryManager _repository;
         private readonly IHttpContextAccessor _httpContextAccessor;
-        private readonly KeyVaultConfigService _keyVaultConfigService;
+        private readonly AppSecrets _appSecrets;
         private readonly HttpClient _httpClient;
-        private readonly IWebHostEnvironment _environment;
-        private readonly string defaultPassword = "SEcurE!Pa$$w0rd_#2025";
+        private readonly EmailQueue _emailQueue;
+        private readonly string requestOrigin = string.Empty;
 
-        public CampaignController(RepositoryContext context, BlobContainerClient blobContainerClient, IMapper mapper, IMailService mailService, IRepositoryManager repository, IHttpContextAccessor httpContextAccessors, IWebHostEnvironment environment, KeyVaultConfigService keyVaultConfigService, HttpClient httpClient)
+        public CampaignController(RepositoryContext context, BlobContainerClient blobContainerClient, IMapper mapper, IMailService mailService, IRepositoryManager repository, IHttpContextAccessor httpContextAccessors, AppSecrets appSecrets, HttpClient httpClient, EmailQueue emailQueue)
         {
             _context = context;
             _mapper = mapper;
@@ -52,12 +58,14 @@ namespace Invest.Controllers
             _blobContainerClient = blobContainerClient;
             _repository = repository;
             _httpContextAccessor = httpContextAccessors;
-            _environment = environment;
-            _keyVaultConfigService = keyVaultConfigService;
+            _appSecrets = appSecrets;
             _httpClient = httpClient;
+            _emailQueue = emailQueue;
+            requestOrigin = httpContextAccessors.HttpContext!.Request.Headers["Origin"].ToString();
         }
 
         [HttpGet]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<ActionResult<IEnumerable<CampaignCardDto>>> GetCampaigns()
         {
             var campaigns = await GetCampaignsCardDto();
@@ -67,7 +75,19 @@ namespace Invest.Controllers
                 return NotFound();
         }
 
-        [HttpGet("withCategories")]
+        [HttpGet("trending-campaigns")]
+        [ModuleAuthorize(PermissionType.View)]
+        public async Task<ActionResult<IEnumerable<CampaignCardDtov2>>> GetTrendingCampaigns()
+        {
+            var campaigns = await GetTrendingCampaignsCardDto();
+            if (campaigns != null)
+                return Ok(campaigns);
+            else
+                return NotFound();
+        }
+
+        [HttpGet("with-categories")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<ActionResult<CampaignCardWithCategories>> GetCampaignsWithCategories(string sourcedBy)
         {
             IEnumerable<CampaignCardDto> campaigns = await GetCampaignsCardDto(sourcedBy);
@@ -89,28 +109,32 @@ namespace Invest.Controllers
             };
         }
 
-        [HttpPost("admincampaigns")]
-        public async Task<IActionResult> GetAdminCampaigns([FromBody] PaginationDto pagination)
+        [HttpGet("admin-campaigns")]
+        [ModuleAuthorize(PermissionType.View)]
+        public async Task<IActionResult> Get([FromQuery] PaginationDto pagination)
         {
+            bool? isDeleted = pagination?.IsDeleted;
+            var search = pagination?.SearchValue?.Trim();
+
             var recommendations = await _context.Recommendations
-                                        .Include(x => x.Campaign)
-                                        .Where(x => x.Amount > 0 &&
-                                                    x.UserEmail != null &&
-                                                    x.Campaign != null &&
-                                                    x.Campaign.Id != null &&
-                                                    (x.Status!.ToLower() == "approved" || x.Status.ToLower() == "pending"))
-                                        .GroupBy(x => x.Campaign!.Id!.Value)
-                                        .Select(g => new
-                                        {
-                                            CampaignId = g.Key,
-                                            CurrentBalance = g.Sum(i => i.Amount ?? 0),
-                                            NumberOfInvestors = g.Select(r => r.UserEmail).Distinct().Count()
-                                        })
-                                        .ToDictionaryAsync(x => x.CampaignId);
+                                                .Include(x => x.Campaign)
+                                                .Where(x => x.Amount > 0 &&
+                                                            x.UserEmail != null &&
+                                                            x.Campaign != null &&
+                                                            x.Campaign.Id != null &&
+                                                            (x.Status!.ToLower() == "approved" || x.Status.ToLower() == "pending"))
+                                                .GroupBy(x => x.Campaign!.Id!.Value)
+                                                .Select(g => new
+                                                {
+                                                    CampaignId = g.Key,
+                                                    CurrentBalance = g.Sum(i => i.Amount ?? 0),
+                                                    NumberOfInvestors = g.Select(r => r.UserEmail).Distinct().Count()
+                                                })
+                                                .ToDictionaryAsync(x => x.CampaignId);
 
             List<int>? stages = null;
 
-            if (!string.IsNullOrEmpty(pagination.Stages))
+            if (!string.IsNullOrEmpty(pagination?.Stages))
             {
                 stages = pagination.Stages
                                     .Split(',', StringSplitOptions.RemoveEmptyEntries)
@@ -119,11 +143,14 @@ namespace Invest.Controllers
             }
 
             var query = _context.Campaigns
+                                .ApplySoftDeleteFilter(isDeleted)
                                 .Where(c =>
-                                    (string.IsNullOrEmpty(pagination.SearchValue)
-                                        || EF.Functions.Like(c.Name!, $"%{pagination.SearchValue}%"))
+                                    (string.IsNullOrEmpty(search)
+                                        || (c.Name != null && EF.Functions.Like(c.Name, $"%{search.ToLower()}%")))
                                     && (stages == null
                                         || (c.Stage.HasValue && stages.Contains((int)c.Stage.Value)))
+                                    && (!pagination!.InvestmentStatus.HasValue
+                                        || c.IsActive == pagination.InvestmentStatus.Value)
                                 )
                                 .Select(c => new
                                 {
@@ -132,11 +159,16 @@ namespace Invest.Controllers
                                     c.CreatedDate,
                                     c.AddedTotalAdminRaised,
                                     c.Stage,
+                                    c.FundraisingCloseDate,
                                     c.IsActive,
                                     c.Property,
                                     OriginalPdfFileName = c.OriginalPdfFileName != null ? c.OriginalPdfFileName : null,
                                     ImageFileName = c.ImageFileName != null ? c.ImageFileName : null,
-                                    PdfFileName = c.PdfFileName != null ? c.PdfFileName : null
+                                    PdfFileName = c.PdfFileName != null ? c.PdfFileName : null,
+                                    c.MetaTitle,
+                                    c.MetaDescription,
+                                    c.DeletedAt,
+                                    c.DeletedByUser
                                 });
 
             var campaignList = await query.ToListAsync();
@@ -146,19 +178,27 @@ namespace Invest.Controllers
                                     .Select(c =>
                                     {
                                         var hasRec = recommendations.TryGetValue(c.Id!.Value, out var rec);
+
                                         return new
                                         {
                                             c.Id,
                                             c.Name,
                                             c.CreatedDate,
                                             c.Stage,
+                                            c.FundraisingCloseDate,
                                             c.IsActive,
                                             c.Property,
                                             OriginalPdfFileName = c.OriginalPdfFileName != null ? c.OriginalPdfFileName : null,
                                             ImageFileName = c.ImageFileName != null ? c.ImageFileName : null,
                                             PdfFileName = c.PdfFileName != null ? c.PdfFileName : null,
                                             CurrentBalance = hasRec ? rec!.CurrentBalance : 0,
-                                            NumberOfInvestors = hasRec ? rec!.NumberOfInvestors : 0
+                                            NumberOfInvestors = hasRec ? rec!.NumberOfInvestors : 0,
+                                            c.MetaTitle,
+                                            c.MetaDescription,
+                                            c.DeletedAt,
+                                            DeletedBy = c.DeletedByUser != null
+                                                        ? $"{c.DeletedByUser.FirstName} {c.DeletedByUser.LastName}"
+                                                        : null
                                         };
                                     })
                                     .ToList();
@@ -166,9 +206,9 @@ namespace Invest.Controllers
             bool isAsc = pagination?.SortDirection?.ToLower() == "asc";
             enrichedCampaigns = pagination?.SortField?.ToLower() switch
             {
-                "name" => isAsc ? enrichedCampaigns.OrderBy(x => x.Name).ToList() : enrichedCampaigns.OrderByDescending(x => x.Name).ToList(),
+                "name" => isAsc ? enrichedCampaigns.OrderBy(x => x.Name?.Trim()).ToList() : enrichedCampaigns.OrderByDescending(x => x.Name?.Trim()).ToList(),
                 "createddate" => isAsc ? enrichedCampaigns.OrderBy(x => x.CreatedDate).ToList() : enrichedCampaigns.OrderByDescending(x => x.CreatedDate).ToList(),
-                "totalrecommendations" => isAsc ? enrichedCampaigns.OrderBy(x => x.CurrentBalance).ToList() : enrichedCampaigns.OrderByDescending(x => x.CurrentBalance).ToList(),
+                "catacapfunding" => isAsc ? enrichedCampaigns.OrderBy(x => x.CurrentBalance).ToList() : enrichedCampaigns.OrderByDescending(x => x.CurrentBalance).ToList(),
                 "totalinvestors" => isAsc ? enrichedCampaigns.OrderBy(x => x.NumberOfInvestors).ToList() : enrichedCampaigns.OrderByDescending(x => x.NumberOfInvestors).ToList(),
                 _ => enrichedCampaigns.OrderByDescending(x => x.CreatedDate).ToList()
             };
@@ -192,7 +232,7 @@ namespace Invest.Controllers
         }
 
         [HttpGet("network")]
-        [Authorize(Roles = "User, Admin")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<ActionResult<IEnumerable<Campaign>>> GetCampaignsNetwork()
         {
             string userId = string.Empty;
@@ -266,14 +306,15 @@ namespace Invest.Controllers
         }
 
         [HttpGet("data")]
-        public async Task<ActionResult<Data>> GetData()
+        [ModuleAuthorize(PermissionType.View)]
+        public async Task<ActionResult<DataDto>> GetData()
         {
             var sdgs = await _context.SDGs.ToListAsync();
             var themes = await _context.Themes.ToListAsync();
             var investmentTypes = await _context.InvestmentTypes.ToListAsync();
             var approvedBy = await _context.ApprovedBy.ToListAsync();
 
-            return new Data
+            return new DataDto
             {
                 Sdg = sdgs,
                 Theme = themes,
@@ -283,12 +324,12 @@ namespace Invest.Controllers
         }
 
         [HttpGet("pdf/{identifier}")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<ActionResult<string>> GetPdf(string identifier)
         {
             if (_context.Campaigns == null)
-            {
                 return NotFound();
-            }
+            
             var campaign = new CampaignDto();
 
             campaign = await _context.Campaigns
@@ -296,14 +337,11 @@ namespace Invest.Controllers
                                         .FirstOrDefaultAsync();
 
             if (campaign == null)
-            {
                 campaign = await _context.Campaigns.FindAsync(Convert.ToInt32(identifier));
-            }
 
             if (campaign == null)
-            {
                 return NotFound();
-            }
+            
             var campaignResponse = _mapper.Map<Campaign>(campaign);
 
             BlockBlobClient pdfBlockBlob = _blobContainerClient.GetBlockBlobClient(campaignResponse.PdfFileName);
@@ -317,34 +355,65 @@ namespace Invest.Controllers
         }
 
         [HttpGet("{identifier}")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<ActionResult<Campaign>> GetCampaign(string identifier)
         {
             if (_context.Campaigns == null)
-            {
                 return NotFound();
-            }
 
             var campaign = new CampaignDto();
 
+            int? campaignId = null;
+
+            if (int.TryParse(identifier, out var parsedId))
+                campaignId = parsedId;
+
             campaign = await _context.Campaigns
-                                        .Where(c => !string.IsNullOrWhiteSpace(c.Property) && c.Property == identifier)
-                                        .FirstOrDefaultAsync();
+                                     .FirstOrDefaultAsync(c =>
+                                         (!string.IsNullOrWhiteSpace(c.Property) && c.Property == identifier) ||
+                                         (campaignId.HasValue && c.Id == campaignId.Value));
 
-            if (campaign == null && int.TryParse(identifier, out int id))
+            if (campaign == null)
             {
-                campaign = await _context.Campaigns.FindAsync(id);
+                var slugs = await _context.Slug
+                                      .FirstOrDefaultAsync(x =>
+                                          x.Type == SlugType.Investment &&
+                                          x.Value == identifier);
+
+                if (slugs != null)
+                    campaign = await _context.Campaigns.FirstOrDefaultAsync(x => x.Id == slugs.ReferenceId);
             }
 
-            if (campaign == null || campaign.IsActive == false)
-            {
+            if (campaign == null)
                 return NotFound();
-            }
-            else if (campaign.Stage == InvestmentStage.ClosedNotInvested)
+
+            switch (campaign.Stage)
             {
-                return Ok(new { Success = false, Message = "This investment has been closed." });
+                case InvestmentStage.ClosedInvested:
+                case InvestmentStage.CompletedOngoing:
+                case InvestmentStage.CompletedOngoingPrivate:
+                    break;
+
+                case InvestmentStage.Vetting:
+                case InvestmentStage.New:
+                    return NotFound();
+
+                case InvestmentStage.ClosedNotInvested:
+                    return Ok(new { Success = false, Message = "This investment has been closed." });
+
+                default:
+                    if (campaign.IsActive == false)
+                    {
+                        return NotFound();
+                    }
+                    break;
             }
 
             var campaignResponse = _mapper.Map<Campaign>(campaign);
+
+            var siteConfigs = await _context.SiteConfiguration.Where(x => x.Type == SiteConfigurationType.StaticValue).ToDictionaryAsync(x => x.Key, x => x.Value);
+
+            campaignResponse.Terms = ReplaceSiteConfigTokens(campaignResponse.Terms!, siteConfigs);
 
             var reccomendations = await _context.Recommendations
                                         .Where(x => x.Campaign != null &&
@@ -360,15 +429,18 @@ namespace Invest.Controllers
                                         })
                                         .FirstOrDefaultAsync();
 
+            campaignResponse.NumberOfInvestors = 0;
+
             if (reccomendations != null)
             {
                 campaignResponse.CurrentBalance = reccomendations.CurrentBalance;
                 campaignResponse.NumberOfInvestors = reccomendations.NumberOfInvestors;
             }
 
-            campaignResponse.CurrentBalance = (campaignResponse.CurrentBalance ?? 0) + (campaignResponse.AddedTotalAdminRaised ?? 0);
+            campaignResponse.CurrentBalance = campaignResponse.CurrentBalance ?? 0;
+            campaignResponse.AddedTotalAdminRaised = campaignResponse.AddedTotalAdminRaised ?? 0;
 
-            if (campaign.Stage == InvestmentStage.ClosedInvested)
+            if (campaign.Stage == InvestmentStage.ClosedInvested || campaign.Stage == InvestmentStage.CompletedOngoing || campaign.Stage == InvestmentStage.CompletedOngoingPrivate)
             {
                 List<int> themeIds = campaign?.Themes?
                                                 .Split(',', StringSplitOptions.RemoveEmptyEntries)
@@ -404,6 +476,7 @@ namespace Invest.Controllers
                                                         TileImageFileName = c.TileImageFileName!,
                                                         ImageFileName = c.ImageFileName!,
                                                         Property = c.Property!,
+                                                        AddedTotalAdminRaised = c.AddedTotalAdminRaised ?? 0,
 
                                                         CurrentBalance = _context.Recommendations
                                                                                     .Where(r => r.Campaign!.Id == c.Id &&
@@ -433,18 +506,16 @@ namespace Invest.Controllers
 
         [HttpGet("admin/{id}")]
         [DisableRequestSizeLimit]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<ActionResult<Campaign>> GetAdminCampaign(int id)
         {
             if (_context.Campaigns == null)
-            {
                 return NotFound();
-            }
+            
             var campaignDto = await _context.Campaigns.Include(x => x.GroupForPrivateAccess).FirstOrDefaultAsync(x => x.Id == id);
 
             if (campaignDto == null)
-            {
                 return NotFound();
-            }
 
             Campaign campaign = _mapper.Map<Campaign>(campaignDto);
 
@@ -461,40 +532,46 @@ namespace Invest.Controllers
             return campaign;
         }
 
-        [HttpPut("/status/{id}")]
-        public async Task<ActionResult<CampaignDto>> UpdateCampaignStatus(int id, bool status)
+        [HttpPut("{id}/status")]
+        [ModuleAuthorize(PermissionType.Manage)]
+        public async Task<ActionResult<CampaignDto>> UpdateStatus(int id, bool status)
         {
             var campaign = await _context.Campaigns.SingleOrDefaultAsync(item => item.Id == id);
             if (campaign == null)
-            {
                 return BadRequest();
-            }
 
             campaign.IsActive = status;
             campaign.ModifiedDate = DateTime.Now;
             await _context.SaveChangesAsync();
             var data = _mapper.Map<CampaignDto>(campaign);
 
-            if (_environment.EnvironmentName == "Production" && status)
+            if (_appSecrets.IsProduction && status)
             {
-                var date = DateTime.Now.ToString("MM/dd/yyyy");
-                var subject = "New Investment approved on Production";
-                var body = $@"
-                            <html>
-                                <body>
-                                    <p>Hello Team!</p>
-                                    <p>A new Investment was approved on Production on {date}: {campaign.Name}</p>
-                                    <p>Thanks.</p>
-                                </body>
-                            </html>
-                            ";
+                var variables = new Dictionary<string, string>
+                {
+                    { "date", DateTime.Now.ToString("MM/dd/yyyy") },
+                    { "investmentLink", $"{_appSecrets.RequestOrigin}/investments/{campaign.Property}" },
+                    { "campaignName", campaign.Name! }
+                };
+
+                _emailQueue.QueueEmail(async (sp) =>
+                {
+                    var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                    await emailService.SendTemplateEmailAsync(
+                        EmailTemplateCategory.InvestmentApproved,
+                        "test@gmail.com",
+                        variables
+                    );
+                });
             }
 
             return Ok(data);
         }
 
-        [DisableRequestSizeLimit]
         [HttpPut("{id}")]
+        [DisableRequestSizeLimit]
+        [ModuleAuthorize(PermissionType.Manage)]
         public async Task<ActionResult<Campaign>> PutCampaign([FromBody] Campaign campaign)
         {
             if (campaign!.Id == null)
@@ -502,658 +579,249 @@ namespace Invest.Controllers
 
             if (campaign.Property != null)
             {
-                bool alreadyExistCampaign = await _context.Campaigns
-                                                    .AnyAsync(x => x.Property != null && x.Id != campaign.Id
-                                                        && x.Property.ToLower().Trim() == campaign.Property.ToLower().Trim());
+                bool existsInSlug = await _context.Slug
+                                            .AnyAsync(x =>
+                                                x.Type == SlugType.Investment &&
+                                                x.ReferenceId != campaign.Id &&
+                                                x.Value == campaign.Property);
 
-                if (alreadyExistCampaign)
-                {
+                bool existsInCampaign = await _context.Campaigns
+                                                    .AnyAsync(x =>
+                                                        x.Property != null &&
+                                                        x.Id != campaign.Id &&
+                                                        x.Property.ToLower().Trim() == campaign.Property);
+
+                if (existsInCampaign || existsInSlug)
                     return Ok(new { Success = false, Message = "Investment name for URL already exists." });
-                }
             }
 
-            if (!string.IsNullOrWhiteSpace(campaign.ContactInfoEmailAddress))
+            var uploadedFiles = await UploadCampaignFiles(campaign);
+            campaign.PdfFileName = uploadedFiles.GetValueOrDefault("PDFPresentation", campaign.PdfFileName);
+            campaign.ImageFileName = uploadedFiles.GetValueOrDefault("Image", campaign.ImageFileName);
+            campaign.TileImageFileName = uploadedFiles.GetValueOrDefault("TileImage", campaign.TileImageFileName);
+            campaign.LogoFileName = uploadedFiles.GetValueOrDefault("Logo", campaign.LogoFileName);
+
+            var existingCampaign = await _context.Campaigns.FirstOrDefaultAsync(x => x.Id == campaign.Id);
+
+            if (!string.IsNullOrWhiteSpace(existingCampaign!.Property))
             {
-                var alreadyExistCampaign = await _context.Campaigns
-                                                        .AnyAsync(x =>
-                                                            !string.IsNullOrWhiteSpace(x.ContactInfoEmailAddress)
-                                                            && x.Id != campaign.Id
-                                                            && x.ContactInfoEmailAddress!.ToLower().Trim() == campaign.ContactInfoEmailAddress.ToLower().Trim());
+                var currentSlug = await _context.Slug
+                                                .FirstOrDefaultAsync(x =>
+                                                    x.Value != null &&
+                                                    x.Type == SlugType.Investment &&
+                                                    x.Value == existingCampaign!.Property);
 
-                if (alreadyExistCampaign)
+                if (currentSlug == null)
                 {
-                    return Ok(new { Success = false, Message = "This organizational email is already used for another investment." });
+                    await _context.Slug.AddAsync(new Slug
+                    {
+                        ReferenceId = campaign.Id.Value,
+                        Type = SlugType.Investment,
+                        Value = existingCampaign!.Property,
+                        CreatedAt = DateTime.Now
+                    });
+
+                    await _context.SaveChangesAsync();
                 }
             }
-
-            if (!string.IsNullOrWhiteSpace(campaign.PDFPresentation))
-            {
-                string pdfFileName = Guid.NewGuid().ToString() + ".pdf";
-                var pdfBlob = _blobContainerClient.GetBlockBlobClient(pdfFileName);
-                var pdfStr = campaign.PDFPresentation.Substring(campaign.PDFPresentation.IndexOf(',') + 1);
-                var pdfBytes = Convert.FromBase64String(pdfStr);
-                using (var stream = new MemoryStream(pdfBytes))
-                {
-                    await pdfBlob.UploadAsync(stream);
-                }
-                //var pdfOldBlob = _blobContainerClient.GetBlockBlobClient(campaign.PdfFileName);
-                //await pdfOldBlob.DeleteIfExistsAsync();
-
-                campaign.PdfFileName = pdfFileName;
-            }
-
-            if (!string.IsNullOrWhiteSpace(campaign.Image))
-            {
-                string imageFileName = Guid.NewGuid().ToString() + ".jpg";
-                var imageBlob = _blobContainerClient.GetBlockBlobClient(imageFileName);
-                var imagestr = campaign.Image.Substring(campaign.Image.IndexOf(',') + 1);
-                var imageBytes = Convert.FromBase64String(imagestr);
-                using (var stream = new MemoryStream(imageBytes))
-                {
-                    await imageBlob.UploadAsync(stream);
-                }
-                //var imageOldBlob = _blobContainerClient.GetBlockBlobClient(campaign.ImageFileName);
-                //await imageOldBlob.DeleteIfExistsAsync();
-
-                campaign.ImageFileName = imageFileName;
-            }
-
-            if (!string.IsNullOrWhiteSpace(campaign.TileImage))
-            {
-                string tileImageFileName = Guid.NewGuid().ToString() + ".jpg";
-                var tileImageBlob = _blobContainerClient.GetBlockBlobClient(tileImageFileName);
-                var tileImagestr = campaign.TileImage.Substring(campaign.TileImage.IndexOf(',') + 1);
-                var tileImageBytes = Convert.FromBase64String(tileImagestr);
-                using (var stream = new MemoryStream(tileImageBytes))
-                {
-                    await tileImageBlob.UploadAsync(stream);
-                }
-                //var tIilemageOldBlob = _blobContainerClient.GetBlockBlobClient(campaign.TileImageFileName);
-                //await tIilemageOldBlob.DeleteIfExistsAsync();
-
-                campaign.TileImageFileName = tileImageFileName;
-            }
-
-            if (!string.IsNullOrWhiteSpace(campaign.Logo))
-            {
-                string logoFileName = Guid.NewGuid().ToString() + ".jpg";
-                var logoBlob = _blobContainerClient.GetBlockBlobClient(logoFileName);
-                var logostr = campaign.Logo.Substring(campaign.Logo.IndexOf(',') + 1);
-                var logoBytes = Convert.FromBase64String(logostr);
-                using (var stream = new MemoryStream(logoBytes))
-                {
-                    await logoBlob.UploadAsync(stream);
-                }
-                //var logoOldBlob = _blobContainerClient.GetBlockBlobClient(campaign.LogoFileName);
-                //await logoOldBlob.DeleteIfExistsAsync();
-
-                campaign.LogoFileName = logoFileName;
-            }
-
-            var existingCampaign = await _context.Campaigns.FindAsync(campaign.Id);
 
             campaign.CreatedDate = existingCampaign?.CreatedDate;
             campaign.ModifiedDate = DateTime.Now;
 
-            if (_environment.EnvironmentName == "Production")
-            {
-                if (existingCampaign?.Stage == InvestmentStage.Public && campaign.Stage == InvestmentStage.Private)
-                {
-                    var date = DateTime.Now.ToString("MM/dd/yyyy");
-                    var subject = "New Investment approved on Production";
-                    var body = $@"
-                                <html>
-                                    <body>
-                                        <p>Hello Team!</p>
-                                        <p>A new Investment was approved on Production on {date}: {campaign.Name}</p>
-                                        <p>Thanks.</p>
-                                    </body>
-                                </html>
-                                ";
-
-                    //_ = Task.Run(async () =>
-                    //{
-                    //    await Task.WhenAll(_mailService.SendMailAsync("", subject, "", body));
-                    //});
-                }
-
-                if (campaign.Stage == InvestmentStage.ComplianceReview)
-                {
-                    var subject = "An investment is ready for compliance review";
-                    var body = $@"
-                                <html>
-                                    <body>
-                                        <p>Hello Tim!</p>
-                                        <p>A new Investment is ready for compliance review: <b>{campaign.Name}</b></p>
-                                        <p>Thanks.</p>
-                                    </body>
-                                </html>
-                                ";
-
-                    //_ = Task.Run(async () =>
-                    //{
-                    //    await Task.WhenAll(_mailService.SendMailAsync("", subject, "", body));
-                    //});
-                }
-            }
-
             var identity = HttpContext.User.Identity as ClaimsIdentity;
             var role = identity?.Claims.FirstOrDefault(i => i.Type == ClaimTypes.Role)?.Value;
 
-            if (role != "Admin")
-            {
-                campaign!.MinimumInvestment = existingCampaign!.MinimumInvestment;
-                campaign!.ApprovedBy = existingCampaign!.ApprovedBy;
-                campaign!.Stage = existingCampaign!.Stage;
-                campaign!.GroupForPrivateAccessDto = _mapper.Map<GroupDto>(existingCampaign.GroupForPrivateAccess);
-                campaign!.Property = existingCampaign!.Property;
-                campaign!.AddedTotalAdminRaised = existingCampaign!.AddedTotalAdminRaised;
-                campaign!.IsActive = existingCampaign!.IsActive;
-            }
+            if (role == UserRoles.User)
+                PreserveAdminFields(existingCampaign!, campaign);
 
             var campaignDto = _mapper.Map(campaign, existingCampaign);
 
-            if (role == "Admin")
+            if (role != UserRoles.User)
             {
-                if (campaign.GroupForPrivateAccessDto != null)
-                {
-                    campaignDto!.GroupForPrivateAccess = _mapper.Map<Group>(campaign.GroupForPrivateAccessDto);
-                    campaignDto!.GroupForPrivateAccessId = campaign.GroupForPrivateAccessDto.Id;
-                }
-                else
-                {
-                    campaignDto!.GroupForPrivateAccess = null;
-                    campaignDto!.GroupForPrivateAccessId = null;
-                }
+                campaignDto!.GroupForPrivateAccess = campaign.GroupForPrivateAccessDto != null
+                                                        ? _mapper.Map<Group>(campaign.GroupForPrivateAccessDto)
+                                                        : null;
+                campaignDto.GroupForPrivateAccessId = campaign.GroupForPrivateAccessDto != null
+                                                        ? campaign.GroupForPrivateAccessDto.Id
+                                                        : null;
             }
 
             _context.Entry(existingCampaign!).State = EntityState.Modified;
 
-            try
-            {
-                await _context.SaveChangesAsync();
-            }
-            catch (DbUpdateConcurrencyException)
-            {
-                if (!CampaignExists(campaign.Id.Value))
-                {
-                    return NotFound();
-                }
-                else
-                {
-                    throw;
-                }
-            }
+            _ = SendUpdateCampaignEmails(existingCampaign!, campaign);
 
-            return Ok();
+            return Ok(new { Success = true, Message = "Campaign details updated successfully", campaign });
         }
 
         [HttpPost("raisemoney")]
         [DisableRequestSizeLimit]
+        [ModuleAuthorize(PermissionType.Manage)]
         public async Task<IActionResult> PostRaiseMoneyCampaign([FromBody] Campaign campaign)
         {
-            try
-            {
-                if (!string.IsNullOrEmpty(campaign.CaptchaToken))
-                {
-                    if (!await VerifyCaptcha(campaign.CaptchaToken))
-                        return BadRequest("CAPTCHA verification failed.");
-                }
+            if (campaign == null)
+                return Ok(new { Success = false, Message = "Campaign data is required." });
 
-                if (campaign == null)
-                {
-                    return Ok(new { Success = false, Message = "Campaign data is required." });
-                }
-                if (campaign.ContactInfoEmailAddress == null)
-                {
-                    return Ok(new { Success = false, Message = "Email is required." });
-                }
+            if (campaign.ContactInfoEmailAddress == null)
+                return Ok(new { Success = false, Message = "Email is required." });
 
-                var userEmail = campaign!.ContactInfoEmailAddress!.Trim().ToLower();
+            if (string.IsNullOrWhiteSpace(campaign.FirstName))
+                return Ok(new { Success = false, Message = "First Name is required." });
 
-                var existingUser = await _context.Users.SingleOrDefaultAsync(u => u.Email.ToLower() == userEmail);
+            if (string.IsNullOrWhiteSpace(campaign.LastName))
+                return Ok(new { Success = false, Message = "Last Name is required." });
 
-                User? user = existingUser;
+            if (!string.IsNullOrEmpty(campaign.CaptchaToken) && !await VerifyCaptcha(campaign.CaptchaToken))
+                return BadRequest("CAPTCHA verification failed.");
 
-                if (user == null)
-                {
-                    if (string.IsNullOrWhiteSpace(campaign.FirstName))
-                    {
-                        return Ok(new { Success = false, Message = "First Name is required." });
-                    }
-                    if (string.IsNullOrWhiteSpace(campaign.LastName))
-                    {
-                        return Ok(new { Success = false, Message = "Last Name is required." });
-                    }
+            var userEmail = campaign!.ContactInfoEmailAddress!.Trim().ToLower();
 
-                    user = await RegisterAnonymousUser(campaign.FirstName!, campaign.LastName!, campaign.ContactInfoEmailAddress.Trim().ToLower()!);
-                }
-                else
-                {
-                    var existingContactInfoEmailAddress = await _context.Campaigns
-                                                                        .AnyAsync(x =>
-                                                                            !string.IsNullOrWhiteSpace(x.ContactInfoEmailAddress)
-                                                                            && x.ContactInfoEmailAddress!.ToLower().Trim() == userEmail);
+            var user = await _context.Users.SingleOrDefaultAsync(u => u.Email.ToLower() == userEmail)
+                        ?? await RegisterAnonymousUser(campaign.FirstName!, campaign.LastName!, campaign.ContactInfoEmailAddress.Trim().ToLower()!);
 
-                    if (existingContactInfoEmailAddress)
-                        return Ok(new { Success = false, Message = "This organizational email is already used for another investment." });
-                }
+            var uploadedFiles = await UploadCampaignFiles(campaign);
+            campaign.PdfFileName = uploadedFiles.GetValueOrDefault("PDFPresentation", campaign.PdfFileName);
+            campaign.ImageFileName = uploadedFiles.GetValueOrDefault("Image", campaign.ImageFileName);
+            campaign.TileImageFileName = uploadedFiles.GetValueOrDefault("TileImage", campaign.TileImageFileName);
+            campaign.LogoFileName = uploadedFiles.GetValueOrDefault("Logo", campaign.LogoFileName);
 
-                string pdfFileName = Guid.NewGuid().ToString() + ".pdf";
-                var pdfBlob = _blobContainerClient.GetBlockBlobClient(pdfFileName);
-                var pdfStr = campaign?.PDFPresentation?.Substring(campaign.PDFPresentation.IndexOf(',') + 1);
-                var pdfBytes = Convert.FromBase64String(pdfStr!);
-                using (var stream = new MemoryStream(pdfBytes))
-                    await pdfBlob.UploadAsync(stream);
+            var mappedCampaign = _mapper.Map<Campaign, CampaignDto>(campaign!);
+            mappedCampaign.Status = "0";
+            mappedCampaign.Stage = InvestmentStage.New;
+            mappedCampaign.IsActive = false;
+            mappedCampaign.PdfFileName = campaign.PdfFileName;
+            mappedCampaign.ImageFileName = campaign.ImageFileName;
+            mappedCampaign.TileImageFileName = campaign.TileImageFileName;
+            mappedCampaign.LogoFileName = campaign.LogoFileName;
+            mappedCampaign.CreatedDate = DateTime.Now;
+            mappedCampaign.EmailSends = false;
+            mappedCampaign.UserId = user != null ? user.Id : null;
 
+            if (campaign.GroupForPrivateAccessDto != null)
+                mappedCampaign.GroupForPrivateAccess = await _context.Groups.FirstOrDefaultAsync(i => i.Id == campaign.GroupForPrivateAccessDto.Id);
 
-                string imageFileName = Guid.NewGuid().ToString() + ".jpg";
-                var imageBlob = _blobContainerClient.GetBlockBlobClient(imageFileName);
-                var imagestr = campaign?.Image?.Substring(campaign.Image.IndexOf(',') + 1);
-                var imageBytes = Convert.FromBase64String(imagestr!);
-                using (var stream = new MemoryStream(imageBytes))
-                    await imageBlob.UploadAsync(stream);
+            _context.Campaigns.Add(mappedCampaign);
+            await _context.SaveChangesAsync();
 
+            _ = SendCreateCampaignEmails(campaign, mappedCampaign, userEmail);
 
-                string tileImageFileName = Guid.NewGuid().ToString() + ".jpg";
-                var tileImageBlob = _blobContainerClient.GetBlockBlobClient(tileImageFileName);
-                var tileImagestr = campaign?.TileImage?.Substring(campaign.TileImage.IndexOf(',') + 1);
-                var tileImageBytes = Convert.FromBase64String(tileImagestr!);
-                using (var stream = new MemoryStream(tileImageBytes))
-                    await tileImageBlob.UploadAsync(stream);
-
-
-                string logoFileName = Guid.NewGuid().ToString() + ".jpg";
-                var logoBlob = _blobContainerClient.GetBlockBlobClient(logoFileName);
-                var logostr = campaign?.Logo?.Substring(campaign.Logo.IndexOf(',') + 1);
-                var logoBytes = Convert.FromBase64String(logostr!);
-                using (var stream = new MemoryStream(logoBytes))
-                    await logoBlob.UploadAsync(stream);
-
-
-                var mappedCampaign = _mapper.Map<Campaign, CampaignDto>(campaign!);
-                mappedCampaign.Status = "0";
-                mappedCampaign.Stage = InvestmentStage.New;
-                mappedCampaign.IsActive = false;
-                mappedCampaign.TileImageFileName = tileImageFileName;
-                mappedCampaign.ImageFileName = imageFileName;
-                mappedCampaign.LogoFileName = logoFileName;
-                mappedCampaign.PdfFileName = pdfFileName;
-                mappedCampaign.CreatedDate = DateTime.Now;
-                mappedCampaign.EmailSends = false;
-                mappedCampaign.UserId = user != null ? user.Id : null;
-
-                mappedCampaign.GroupForPrivateAccess = campaign?.GroupForPrivateAccessDto != null ? await _context.Groups.FirstOrDefaultAsync(i => i.Id == campaign.GroupForPrivateAccessDto.Id) : null;
-
-                _context.Campaigns.Add(mappedCampaign);
-                await _context.SaveChangesAsync();
-
-                if (_environment.EnvironmentName == "Production")
-                {
-                    var parsIdSdgs = campaign?.SDGs?.Split(',').Select(id => int.Parse(id)).ToList();
-                    var parsIdInvestmentTypes = campaign?.InvestmentTypes?.Split(',').Select(id => int.Parse(id)).ToList();
-                    var parsIdThemes = campaign?.Themes?.Split(',').Select(id => int.Parse(id)).ToList();
-
-                    var sdgNames = _context.SDGs.Where(c => parsIdSdgs!.Contains(c.Id)).Select(c => c.Name).ToList();
-                    var themeNames = _context.Themes.Where(c => parsIdThemes!.Contains(c.Id)).Select(c => c.Name).ToList();
-                    var investmentTypeNames = _context.InvestmentTypes.Where(c => parsIdInvestmentTypes!.Contains(c.Id)).Select(c => c.Name).ToList();
-
-                    var sdgNamesString = string.Join(", ", sdgNames);
-                    var themeNamesString = string.Join(", ", themeNames);
-                    var investmentTypeNamesString = string.Join(", ", investmentTypeNames);
-
-                    var emailParts = new List<string>
-                    {
-                        $"<p>User Name: {campaign!.FirstName} {campaign.LastName}</p><br/>",
-                        $"<p>Investment Owner Email: {campaign.ContactInfoEmailAddress}</p><br/>",
-                        $"<p>Investment Informational Email: {campaign.InvestmentInformationalEmail}</p><br/>",
-                        $"<p>Mobile Number: {campaign.ContactInfoPhoneNumber}</p><br/>",
-                        $"<p>Address Line 1: {campaign.ContactInfoAddress}</p><br/>"
-                    };
-
-                    if (!string.IsNullOrWhiteSpace(campaign.ContactInfoAddress2))
-                        emailParts.Add($"<p>Address Line 2: {campaign.ContactInfoAddress2}</p><br/>");
-
-                    if (!string.IsNullOrWhiteSpace(campaign.City))
-                        emailParts.Add($"<p>City: {campaign.City}</p><br/>");
-
-                    if (!string.IsNullOrWhiteSpace(campaign.State))
-                        emailParts.Add($"<p>State: {campaign.State}</p><br/>");
-
-                    if (!string.IsNullOrWhiteSpace(campaign.ZipCode))
-                        emailParts.Add($"<p>Zip Code: {campaign.ZipCode}</p><br/>");
-
-                    emailParts.AddRange(new[]
-                    {
-                        $"<p>Investment Name: {campaign?.Name}</p><br/>",
-                        $"<p>About the Investment: {campaign?.Description}</p><br/>",
-                        $"<p>Investment website URL: {campaign?.Website}</p><br/>",
-                        $"<p>Type of Investment: {investmentTypeNamesString}</p><br/>",
-                        $"<p>Investment Terms: {campaign?.Terms}</p><br/>",
-                        $"<p>Fundraising Goal: {campaign?.Target}</p><br/>",
-                        $"<p>Expected Fundraising Close Date or Evergreen: {campaign?.FundraisingCloseDate}</p><br/>",
-                        $"<p>Investment Themes Covered: {themeNamesString}</p><br/>",
-                        $"<p>SDGs impacted by investment: {sdgNamesString}</p><br/>",
-                        $"<p>Have you received funding from Impact Assets before?: {campaign?.ImpactAssetsFundingStatus}</p><br/>",
-                        $"<p>Your role with the investment: {campaign?.InvestmentRole}</p><br/>"
-                    });
-
-                    var emailBody = $"<html><body>{string.Join("", emailParts)}</body></html>";
-
-                    var date = DateTime.Now.Date.ToString("M/d/yyyy");
-                    var subject = "New Investment live on Production";
-                    var body = $@"
-                                <html>
-                                    <body>
-                                        <p>Hello Team!</p>
-                                        <br/>
-                                        <p>A new Investment was posted to Production on {date}: <strong>{mappedCampaign.Name}</strong>.</p>
-                                        <br/>
-                                        <p>Thanks.</p>
-                                    </body>
-                                </html>";
-
-                    _ = Task.Run(async () =>
-                    {
-                        await Task.WhenAll(
-                            _mailService.SendMailAsync("investment.campaign@mailinator.com", "New request to raise money", "", emailBody),
-                            _mailService.SendMailAsync("investment.campaign@mailinator.com", subject, "", body)
-                        );
-                    });
-                }
-
-                return Ok(new { Success = true, Message = "Investment has been created successfully." });
-            }
-            catch (Exception ex)
-            {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
-            }
+            return Ok(new { Success = true, Message = "Investment has been created successfully." });
         }
 
-        private async Task<bool> VerifyCaptcha(string token)
+        [HttpGet("send-investment-qr-code-email")]
+        [ModuleAuthorize(PermissionType.View)]
+        public async Task<IActionResult> SendInvestmentQRCodeEmail(int id, string investmentTag)
         {
-            string captchaSecretKey = _keyVaultConfigService.GetCaptchaSecretKey();
+            var investment = await _context.Campaigns.FirstOrDefaultAsync(x => x.Id == id);
 
-            var requestContent = new FormUrlEncodedContent(new[]
+            if (string.IsNullOrWhiteSpace(investment?.ContactInfoEmailAddress))
+                return Ok(new { Success = false, Message = "You can’t send QR by email because your organizational email isn’t set up yet" });
+
+            string? investmentUrl = !string.IsNullOrEmpty(investmentTag)
+                                    ? investmentTag
+                                    : !string.IsNullOrEmpty(investment.Property)
+                                        ? $"{requestOrigin}/investments/{Uri.EscapeDataString(investment.Property)}"
+                                        : null;
+
+            if (string.IsNullOrWhiteSpace(investmentUrl))
+                return Ok(new { Success = false, Message = "Failed to send email because investment URL is missing." });
+
+            string fullName = investment.ContactInfoFullName ?? string.Empty;
+            string[] parts = fullName.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            string firstName = parts.Length > 0 ? parts[0] : string.Empty;
+
+            using var qrGenerator = new QRCodeGenerator();
+            using var qrCodeData = qrGenerator.CreateQrCode(investmentUrl, QRCodeGenerator.ECCLevel.Q);
+            var qrCode = new PngByteQRCode(qrCodeData);
+            byte[] qrBytes = qrCode.GetGraphic(20);
+
+            var qrAttachment = new EmailAttachment(
+                name: $"{investment.Name}.png",
+                contentType: "image/png",
+                content: BinaryData.FromBytes(qrBytes)
+            );
+
+            var variables = new Dictionary<string, string>
             {
-                new KeyValuePair<string, string>("secret", captchaSecretKey),
-                new KeyValuePair<string, string>("response", token)
+                { "firstName", firstName },
+                { "investmentName", investment.Name! },
+                { "unsubscribeUrl", $"{_appSecrets.RequestOrigin}/settings" }
+            };
+
+            _emailQueue.QueueEmail(async (sp) =>
+            {
+                var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                await emailService.SendTemplateEmailAsync(
+                    EmailTemplateCategory.InvestmentQRCode,
+                    investment.ContactInfoEmailAddress!.Trim().ToLower(),
+                    variables,
+                    attachments: new List<EmailAttachment> { qrAttachment }
+                );
             });
 
-            var response = await _httpClient.PostAsync("https://hcaptcha.com/siteverify", requestContent);
-
-            var content = await response.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(content);
-            bool isSuccess = doc.RootElement.GetProperty("success").GetBoolean();
-
-            return isSuccess;
-        }
-
-        private async Task<User> RegisterAnonymousUser(string firstName, string lastName, string email)
-        {
-            var userName = $"{firstName}{lastName}".Trim().ToLower();
-            Random random = new Random();
-            while (_context.Users.Any(x => x.UserName == userName))
-            {
-                userName = $"{userName}{random.Next(0, 100)}".ToLower();
-            }
-
-            UserRegistrationDto registrationDto = new UserRegistrationDto()
-            {
-                FirstName = firstName,
-                LastName = lastName,
-                UserName = userName,
-                Password = defaultPassword,
-                Email = email
-            };
-
-            await _repository.UserAuthentication.RegisterUserAsync(registrationDto, UserRoles.User);
-
-            var user = await _repository.UserAuthentication.GetUserByUserName(userName);
-            user.IsFreeUser = true;
-
-            if (_environment.EnvironmentName == "Production")
-            {
-                var profileId = await CreateKlaviyoProfile(user);
-                if (!string.IsNullOrEmpty(profileId))
-                    user.KlaviyoProfileId = profileId;
-            }
-            await _repository.UserAuthentication.UpdateUser(user);
-            await _repository.SaveAsync();
-
-            var requestOrigin = HttpContext?.Request.Headers["Origin"].ToString();
-
-            _ = SendWelcomeEmail(requestOrigin!, email, userName, firstName!);
-
-            return user;
-        }
-
-        private async Task<string?> CreateKlaviyoProfile(User user)
-        {
-            string klaviyoApiKey = _keyVaultConfigService.GetKlaviyoApiKey();
-            string klaviyoListKey = _keyVaultConfigService.GetKlaviyoListKey();
-
-            _httpClient.DefaultRequestHeaders.Clear();
-            _httpClient.DefaultRequestHeaders.Add("Authorization", $"Klaviyo-API-Key {klaviyoApiKey}");
-            _httpClient.DefaultRequestHeaders.Add("revision", "2024-05-15");
-
-            var payload = new
-            {
-                data = new
-                {
-                    type = "profile",
-                    attributes = new
-                    {
-                        email = user.Email,
-                        first_name = user.FirstName,
-                        last_name = user.LastName,
-                        properties = new
-                        {
-                            isFreeUser = true,
-                            name = $"{user.FirstName} {user.LastName}"
-                        }
-                    }
-                }
-            };
-
-            var json = JsonSerializer.Serialize(payload);
-            var content = new StringContent(json, Encoding.UTF8, "application/json");
-            var klaviyoResponse = await _httpClient.PostAsync("https://a.klaviyo.com/api/profiles/", content);
-
-            if (!klaviyoResponse.IsSuccessStatusCode)
-                return null;
-
-            var responseContent = await klaviyoResponse.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(responseContent);
-            var profileId = doc.RootElement.GetProperty("data").GetProperty("id").GetString();
-
-            var listPayload = new
-            {
-                data = new[]
-                {
-                    new { type = "profile", id = profileId }
-                }
-            };
-            var listJson = JsonSerializer.Serialize(listPayload);
-            var listContent = new StringContent(listJson, Encoding.UTF8, "application/json");
-            string url = $"https://a.klaviyo.com/api/lists/{klaviyoListKey}/relationships/profiles/";
-
-            await _httpClient.PostAsync(url, listContent);
-            return profileId;
-        }
-
-        private async Task SendWelcomeEmail(string request, string emailTo, string userName, string firstName)
-        {
-            string logoUrl = $"{request}/logo-for-email.png";
-            string logoHtml = $@"
-                                <div style='text-align: center;'>
-                                    <a href='https://investment-campaign.org' target='_blank'>
-                                        <img src='{logoUrl}' alt='Logo' width='300' height='150' />
-                                    </a>
-                                </div>";
-
-            string resetPasswordUrl = $"{request}/forgotpassword";
-            string userSettingsUrl = $"{request}/settings";
-            string subject = "Welcome to Investment Campaign - Let’s Move Capital That Matters 💥";
-
-            var body = logoHtml + $@"
-                                    <html>
-                                        <body>
-                                            <p><b>Hi {firstName},</b></p>
-                                            <p>Welcome to <b>Investment Campaign</b> - the movement turning philanthropic dollars into <b>powerful, catalytic investments</b> that fuel real change.</p>
-                                            <p>You’ve just joined what we believe will become the <b>largest community of catalytic capital champions</b> on the planet. Whether you're a donor, funder, or impact-curious investor - you're in the right place.</p>
-                                            <p>Your Investment Campaign username: <b>{userName}</b></p>
-                                            <p>To set your password: <a href='{resetPasswordUrl}' target='_blank'>Click here</a></p>
-                                            <p>Here’s what you can do right now on Investment Campaign:</p>
-                                            <p>🔎 <b>1. Discover Investments Aligned with Your Values</b></p>
-                                            <p style='margin-bottom: 0px;'>Use your <b>DAF, foundation, or donation capital</b> to fund vetted companies, VC funds, and loan structures — not just nonprofits.</p>
-                                            <p style='margin-top: 0px;'>➡️ <a href='{request}/find'>Browse live investment opportunities</a></p>
-                                            <p>🤝 <b>2. Connect with Like-Minded Peers</b></p>
-                                            <p style='margin-bottom: 0px;'>Follow friends and colleagues, share opportunities, or keep your giving private — you’re in control.</p>
-                                            <p style='margin-top: 0px;'>➡️ <a href='{request}/community'>Explore the Investment Campaign community</a></p>
-                                            <p>🗣️ <b>3. Join or Start a Group</b></p>
-                                            <p style='margin-bottom: 0px;'>Find (or create!) groups around shared causes and funding themes — amplify what matters to you.</p>
-                                            <p style='margin-top: 0px;'>➡️ <a href='{request}/community'>See active groups and start your own</a></p>
-                                            <p>🚀 <b>4. Recommend Deals You Believe In</b></p>
-                                            <p style='margin-bottom: 0px;'>Champion investments that should be seen — and funded — by others in the community.</p>
-                                            <p style='margin-top: 0px;'>➡️ <a href='https://investment-campaign.org/lead-investor/'>Propose an opportunity</a></p>
-                                            <p>We’re here to help you put your capital to work — boldly, effectively, and in community.</p>
-                                            <p>Thanks for joining us. Let’s fund what we wish existed — together.</p>
-                                            <p style='margin-bottom: 0px;'><b>The Investment Campaign Team</b></p>
-                                            <p style='margin-top: 0px;'>🌍 <a href='https://investment-campaign.org/'>investment-campaign.org</a> | 💼 <a href='https://www.linkedin.com/company/investment-campaign-us/'>Follow us on LinkedIn</a></p>
-                                            <p>Have questions? Email Shabbir at <a href='mailto:investment.campaign@mailinator.com'>investment.campaign@mailinator.com</a></p>
-                                            <p><a href='{request}/settings' target='_blank'>Unsubscribe</a> from Investment Campaign notifications.</p>
-                                        </body>
-                                    </html>";
-
-            await _mailService.SendMailAsync(emailTo, subject, "", body);
-        }
-
-        [HttpGet("send-investment-QR-code-email")]
-        public async Task<IActionResult> SendInvestmentQACodeEmail(int id)
-        {
-            try
-            {
-                var requestOrigin = HttpContext?.Request.Headers["Origin"].ToString();
-                string subject = "🚀 Share Your Investment with the World – Your QR Code is Ready!";
-
-                var investment = await _context.Campaigns.FindAsync(id);
-
-                string investmentUrl = $"{requestOrigin}/invest/{Uri.EscapeDataString(investment!.Property!.Trim())}";
-                string fullName = investment.ContactInfoFullName ?? string.Empty;
-                string[] parts = fullName.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                string firstName = parts.Length > 0 ? parts[0] : string.Empty;
-
-                using var qrGenerator = new QRCodeGenerator();
-                using var qrCodeData = qrGenerator.CreateQrCode(investmentUrl, QRCodeGenerator.ECCLevel.Q);
-                var qrCode = new PngByteQRCode(qrCodeData);
-                byte[] qrBytes = qrCode.GetGraphic(20);
-
-                var body = $@"
-                                <html>
-                                    <body>
-                                        <p>Hi {firstName},</p>
-                                        <p>Exciting news – your investment <b>{investment.Name}</b> is now live on Investment Campaign! 🎉</p>
-                                        <p>To help you spread the word, we've generated a <b>QR code just for you </b>– it’s attached to this email and ready to go.</p>
-                                        <p>📲 Share it on socials, in emails, or at events – wherever you want to grow your support!</p>
-                                        <p>We’re cheering you on and can’t wait to see your fundraising take flight.</p>
-                                        <p>As always, the Investment Campaign team is here if you need anything.</p>
-                                        <p>Onwards and upwards,</p>
-                                        <p style='margin-bottom: 0px;'><b>The Investment Campaign Team</b></p>
-                                        <p style='margin-top: 0px; margin-bottom: 0px;'>🔗 <a href='https://www.linkedin.com/company/investment-campaign-us/'>LinkedIn</a></p>
-                                        <p style='margin-top: 0px; margin-bottom: 0px;'>🌐 <a href='https://investment-campaign.org/'>investment-campaign.org</a></p>
-                                        <p style='margin-top: 0px;'>✉️ <a href='mailto:investment.campaign@mailinator.com'>investment.campaign@mailinator.com</a></p>
-                                        <p>—</p>
-                                        <p>Questions, feedback, or just want to say hi? Reach out to us anytime.</p>
-                                        <p>Don’t want to get these emails? <a href='{requestOrigin}/settings' target='_blank'>Unsubscribe</a>.</p>
-                                    </body>
-                                </html>";
-
-                var qrAttachment = new EmailAttachment(
-                    name: $"{investment.Name}.png",
-                    contentType: "image/png",
-                    content: BinaryData.FromBytes(qrBytes)
-                );
-
-                await _mailService.SendMailAsync(investment!.ContactInfoEmailAddress!.Trim().ToLower(), subject, "", body, new List<EmailAttachment> { qrAttachment });
-
-                return Ok(new { Success = true, Message = "Email sent successfully." });
-            }
-            catch (Exception ex)
-            {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
-            }
+            return Ok(new { Success = true, Message = "Email sent successfully." });
         }
 
         [HttpDelete("{id}")]
+        [ModuleAuthorize(PermissionType.Delete)]
         public async Task<IActionResult> DeleteCampaign(int id)
         {
-            if (_context.Campaigns == null)
-            {
-                return NotFound();
-            }
-
-            var recommendationsToRemove = await _context.Recommendations.Where(i => i.Campaign!.Id == id).ToListAsync();
-
-            foreach (var r in recommendationsToRemove)
-            {
-                _context.Recommendations.Remove(r);
-            }
-
-            var campaign = await _context.Campaigns.FindAsync(id);
+            var campaign = await _context.Campaigns.FirstOrDefaultAsync(x => x.Id == id);
             if (campaign == null)
-            {
                 return NotFound();
-            }
+
+            var recommendations = _context.Recommendations.Where(r => r.CampaignId == id);
+            _context.Recommendations.RemoveRange(recommendations);
+
+            var accountBalanceChangeLogs = _context.AccountBalanceChangeLogs.Where(r => r.CampaignId == id);
+            _context.AccountBalanceChangeLogs.RemoveRange(accountBalanceChangeLogs);
 
             _context.Campaigns.Remove(campaign);
             await _context.SaveChangesAsync();
-
-            //BlockBlobClient tileImageBlockBlob = _blobContainerClient.GetBlockBlobClient(campaign.TileImageFileName);
-            //BlockBlobClient imageBlockBlob = _blobContainerClient.GetBlockBlobClient(campaign.ImageFileName);
-            //BlockBlobClient logoBlockBlob = _blobContainerClient.GetBlockBlobClient(campaign.LogoFileName);
-            //BlockBlobClient pdfBlockBlob = _blobContainerClient.GetBlockBlobClient(campaign.PdfFileName);
-
-            //await tileImageBlockBlob.DeleteIfExistsAsync();
-            //await imageBlockBlob.DeleteIfExistsAsync();
-            //await logoBlockBlob.DeleteIfExistsAsync();
-            //await pdfBlockBlob.DeleteIfExistsAsync();
 
             return NoContent();
         }
 
         [HttpGet("portfolio")]
-        public async Task<ActionResult<Portfolio>> GetPortfolio()
+        [ModuleAuthorize(PermissionType.View)]
+        public async Task<ActionResult<PortfolioDto>> GetPortfolio()
         {
             var identity = HttpContext.User.Identity as ClaimsIdentity;
 
             if (_context.Users == null || identity == null)
-            {
                 return NotFound();
-            }
 
             var email = identity.Claims.FirstOrDefault(i => i.Type == ClaimTypes.Email)?.Value;
 
             if (email == null || email == string.Empty)
-            {
                 return NotFound();
-            }
 
-            var portfolio = new Portfolio();
+            var portfolio = new PortfolioDto();
+
             var user = await _context.Users.FirstOrDefaultAsync(i => i.Email == email);
+
+            if (user == null)
+                return NotFound();
+
             portfolio.AccountBalance = user?.AccountBalance;
 
-            var groupAccountBalance = await _context.GroupAccountBalance.FirstOrDefaultAsync(g => g.User.Id == user!.Id);
+            var groupAccountBalance = await _context.GroupAccountBalance
+                                                    .Where(g => g.User != null
+                                                            && g.User.Id == user!.Id)
+                                                    .Select(g => (decimal?)g.Balance)
+                                                    .SumAsync();
+
             if (groupAccountBalance != null)
-            {
-                portfolio.GroupBalance = groupAccountBalance.Balance;
-            }
+                portfolio.GroupBalance = groupAccountBalance;
 
             var userRecommendations = await _context.Recommendations
-                .Where(i => i.UserEmail == email && (i.Status == "approved" || i.Status == "pending"))
-                .Include(item => item.Campaign)
-                .ToListAsync();
+                                                    .Where(i => i.UserEmail == email
+                                                            && (i.Status == "approved" || i.Status == "pending"))
+                                                    .Include(item => item.Campaign)
+                                                    .ToListAsync();
+
             List<RecommendationsDto> dataRecommendation = new List<RecommendationsDto>();
+
             if (userRecommendations.Count > 0)
             {
                 for (int i = 0; i < userRecommendations.Count; i++)
@@ -1172,10 +840,14 @@ namespace Invest.Controllers
             if (dataRecommendation != null)
             {
                 var campaignIds = dataRecommendation
-                .Select(i => i.CampaignId);
+                                    .Where(i => i.CampaignId != null)
+                                    .Select(i => i.CampaignId)
+                                    .ToList(); ;
+
                 var data = await _context.Campaigns
-                    .Where(i => campaignIds.Contains(i.Id))
-                    .ToListAsync();
+                                         .Where(i => campaignIds.Contains(i.Id))
+                                         .ToListAsync();
+
                 var userCampaigns = _mapper.Map<List<CampaignDto>, List<Campaign>>(data);
 
                 var userRecommendationBalances = await _context.Recommendations
@@ -1204,88 +876,14 @@ namespace Invest.Controllers
                 }
 
                 portfolio.Recommendations = dataRecommendation;
-                portfolio.Campaigns = userCampaigns;
+                portfolio.Campaigns = userCampaigns.Where(c => c.Stage != InvestmentStage.ClosedNotInvested).ToList();
             }
-
 
             return portfolio;
         }
 
-        private async Task<IEnumerable<CampaignCardDto>> GetCampaignsCardDto(string? sourcedBy = null)
-        {
-            if (_context.Campaigns == null)
-            {
-                return null!;
-            }
-
-            var sourcedByNamesList = sourcedBy?.ToLower().Split(',').Select(n => n.Trim()).ToList();
-
-            var approvedBy = sourcedByNamesList == null || !sourcedByNamesList.Any()
-                            ? new List<int>()
-                            : await _context.ApprovedBy
-                                            .Where(x => sourcedByNamesList.Contains(x.Name!.ToLower()))
-                                            .Select(x => x.Id)
-                                            .ToListAsync();
-
-            var campaigns = await _context.Campaigns
-                                            .Where(i => i.IsActive!.Value && i.Stage == InvestmentStage.Public)
-                                            .Include(i => i.GroupForPrivateAccess)
-                                            .ToListAsync();
-
-            if (approvedBy.Any())
-            {
-                campaigns = campaigns
-                                .Where(c => !string.IsNullOrWhiteSpace(c.ApprovedBy) &&
-                                            approvedBy.Any(id => c.ApprovedBy
-                                                .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                                                .Select(s => s.Trim())
-                                                .Where(s => int.TryParse(s, out _))
-                                                .Select(int.Parse)
-                                                .Contains(id)))
-                                .ToList();
-            }
-
-            var data = campaigns
-                              .Select(c => new
-                              {
-                                  Campaign = c,
-                                  Recommendations = _context.Recommendations
-                                                            .Where(r => r.Campaign != null &&
-                                                                    r.Campaign.Id == c.Id &&
-                                                                    (r.Status!.ToLower() == "approved" || r.Status.ToLower() == "pending") &&
-                                                                    r.Amount > 0 &&
-                                                                    r.UserEmail != null)
-                                                            .GroupBy(r => r.Campaign!.Id)
-                                                            .Select(g => new
-                                                            {
-                                                                CurrentBalance = g.Sum(r => r.Amount ?? 0),
-                                                                NumberOfInvestors = g.Select(r => r.UserEmail!.ToLower().Trim()).Distinct().Count()
-                                                            })
-                                                            .FirstOrDefault()
-                              })
-                              .ToList();
-
-            var result = data.Select(item =>
-            {
-                var campaignDto = _mapper.Map<CampaignCardDto>(item.Campaign);
-                if (item.Recommendations != null)
-                {
-                    campaignDto.CurrentBalance = item.Recommendations.CurrentBalance + (item.Campaign.AddedTotalAdminRaised ?? 0);
-                    campaignDto.NumberOfInvestors = item.Recommendations.NumberOfInvestors;
-                }
-                campaignDto.GroupForPrivateAccessDto = _mapper.Map<GroupDto>(item.Campaign.GroupForPrivateAccess);
-                return campaignDto;
-            }).ToList();
-
-            return result;
-        }
-
-        private bool CampaignExists(int id)
-        {
-            return (_context.Campaigns?.Any(e => e.Id == id)).GetValueOrDefault();
-        }
-
-        [HttpGet("Export")]
+        [HttpGet("export")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<IActionResult> ExportCampaigns()
         {
             var campaigns = await _context.Campaigns
@@ -1293,7 +891,7 @@ namespace Invest.Controllers
                                             .Include(c => c.Recommendations)
                                             .ToListAsync();
 
-            var campaignDtos = campaigns.Select(c => new CampaignDto
+            var campaignDtos = campaigns.Select(c => new ExportCampaignDto
             {
                 Id = c.Id,
                 Name = c.Name,
@@ -1311,13 +909,15 @@ namespace Invest.Controllers
                 ContactInfoEmailAddress = c.ContactInfoEmailAddress,
                 InvestmentInformationalEmail = c.InvestmentInformationalEmail,
                 ContactInfoPhoneNumber = c.ContactInfoPhoneNumber,
+                Country = c.Country,
+                OtherCountryAddress = c.OtherCountryAddress,
                 City = c.City,
                 State = c.State,
                 ZipCode = c.ZipCode,
                 NetworkDescription = c.NetworkDescription,
                 ImpactAssetsFundingStatus = c.ImpactAssetsFundingStatus,
                 InvestmentRole = c.InvestmentRole,
-                Referred = c.Referred,
+                ReferredToCataCap = c.Referred,
                 Target = c.Target,
                 Status = c.Status,
                 TileImageFileName = c.TileImageFileName,
@@ -1326,7 +926,11 @@ namespace Invest.Controllers
                 OriginalPdfFileName = c.OriginalPdfFileName,
                 LogoFileName = c.LogoFileName,
                 IsActive = c.IsActive,
+                IsPartOfFund = c.IsPartOfFund,
+                AssociatedFundId = c.AssociatedFundId,
+                FeaturedInvestment = c.FeaturedInvestment,
                 Stage = c.Stage,
+                InvestmentTag = "",
                 Property = c.Property,
                 AddedTotalAdminRaised = c.AddedTotalAdminRaised,
                 Groups = c.Groups.ToList(),
@@ -1336,9 +940,18 @@ namespace Invest.Controllers
                 FundraisingCloseDate = c.FundraisingCloseDate,
                 MissionAndVision = c.MissionAndVision,
                 PersonalizedThankYou = c.PersonalizedThankYou,
-                //HasExistingInvestors = c.HasExistingInvestors,
                 ExpectedTotal = c.ExpectedTotal,
-                CreatedDate = c.CreatedDate
+                InvestmentTypeCategory = c.InvestmentTypeCategory,
+                EquityValuation = c.EquityValuation,
+                EquitySecurityType = c.EquitySecurityType,
+                FundTerm = c.FundTerm,
+                EquityTargetReturn = c.EquityTargetReturn,
+                DebtPaymentFrequency = c.DebtPaymentFrequency,
+                DebtMaturityDate = c.DebtMaturityDate,
+                DebtInterestRate = c.DebtInterestRate,
+                CreatedDate = c.CreatedDate,
+                MetaTitle = c.MetaTitle,
+                MetaDescription = c.MetaDescription
             }).ToList();
 
             string contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
@@ -1350,13 +963,15 @@ namespace Invest.Controllers
 
                 string[] headers = new string[]
                 {
-                    "Id", "Name", "Description", "Themes", "Approved By", "SDGs", "Investment Types",
+                    "Id", "Name", "Description", "Themes", "Approved By", "SDGs", "Type of Investment",
                     "Terms", "Minimum Investment", "Website", "Contact Info FullName", "Contact Info Address1", "Contact Info Address2",
-                    "Contact Info Email Address", "Investment Informational Email", "Contact Info Phone Number", "City", "State", "ZipCode", "Tell us a bit about your network", "ImpactAssetsFundingStatus",
-                    "InvestmentRole", "How where you referred to Investment Campaign?", "Target", "Status", "Tile Image File Name", "Image File Name", "Pdf File Name", "Original Pdf File Name",
-                    "Logo File Name", "Is Active", "Stage", "Property", "Added Total Admin Raised",
+                    "Investment Owner email", "Investment Informational Email", "Contact Info Phone Number", "Country", "Other Country Address", "City", "State", "ZipCode", "Tell us a bit about your network", "ImpactAssetsFundingStatus",
+                    "InvestmentRole", "How where you referred to CataCap?", "Target", "Status", "Tile Image File Name", "Image File Name", "Pdf File Name", "Original Pdf File Name",
+                    "Logo File Name", "Is Active", "Is Part Of Fund", "Associated Fund", "Featured Investment", "Stage", "Property", "Added Total Admin Raised",
                     "Groups", "Total Recommendations","Total Investors", "Group For Private Access", "Email Sends", "Expected Fundraising Close Date",
-                    "Mission/Vision", "Personalized Thank You", "How much money do you already have in commitments for your investment", "Created Date"
+                    "Mission/Vision", "Personalized Thank You", "How much money do you already have in commitments for your investment",
+                    "Investment Type", "Equity / Valuation", "Equity / Security Type", "Fund / Term", "Equity / Funds Target Return",
+                    "Debt / Payment Frequency", "Debt / Maturity Date", "Debt / Interest Rate", "Created Date", "Meta Title", "Meta Description"
                 };
 
                 for (int i = 0; i < headers.Length; i++)
@@ -1387,13 +1002,15 @@ namespace Invest.Controllers
                     worksheet.Cell(row, col++).Value = dto.ContactInfoEmailAddress;
                     worksheet.Cell(row, col++).Value = dto.InvestmentInformationalEmail;
                     worksheet.Cell(row, col++).Value = dto.ContactInfoPhoneNumber;
+                    worksheet.Cell(row, col++).Value = dto.Country;
+                    worksheet.Cell(row, col++).Value = dto.OtherCountryAddress;
                     worksheet.Cell(row, col++).Value = dto.City;
                     worksheet.Cell(row, col++).Value = dto.State;
                     worksheet.Cell(row, col++).Value = dto.ZipCode;
                     worksheet.Cell(row, col++).Value = dto.NetworkDescription;
                     worksheet.Cell(row, col++).Value = dto.ImpactAssetsFundingStatus;
                     worksheet.Cell(row, col++).Value = dto.InvestmentRole;
-                    worksheet.Cell(row, col++).Value = dto.Referred;
+                    worksheet.Cell(row, col++).Value = dto.ReferredToCataCap;
                     worksheet.Cell(row, col++).Value = dto.Target;
                     worksheet.Cell(row, col++).Value = dto.Status;
                     worksheet.Cell(row, col++).Value = dto.TileImageFileName;
@@ -1402,6 +1019,12 @@ namespace Invest.Controllers
                     worksheet.Cell(row, col++).Value = dto.OriginalPdfFileName;
                     worksheet.Cell(row, col++).Value = dto.LogoFileName;
                     worksheet.Cell(row, col++).Value = dto.IsActive.HasValue && dto.IsActive.Value ? "Active" : "Inactive";
+                    worksheet.Cell(row, col++).Value = dto.IsPartOfFund ? "Yes" : "No";
+
+                    var campaign = await _context.Campaigns.FirstOrDefaultAsync(x => x.Id == dto.AssociatedFundId);
+                    worksheet.Cell(row, col++).Value = dto.IsPartOfFund ? campaign?.Name : null;
+
+                    worksheet.Cell(row, col++).Value = dto.FeaturedInvestment ? "Yes" : "No";
 
                     var description = (dto.Stage?.GetType()
                                          .GetField(dto.Stage?.ToString()!)
@@ -1442,13 +1065,27 @@ namespace Invest.Controllers
                     worksheet.Cell(row, col++).Value = dto.FundraisingCloseDate != null ? dto.FundraisingCloseDate : null;
                     worksheet.Cell(row, col++).Value = dto.MissionAndVision;
                     worksheet.Cell(row, col++).Value = dto.PersonalizedThankYou;
-                    //worksheet.Cell(row, 34).Value = dto.HasExistingInvestors.HasValue && dto.HasExistingInvestors.Value ? "Yes" : "No";
 
                     var expectedTotalCell = worksheet.Cell(row, col++);
                     expectedTotalCell.Value = dto.ExpectedTotal;
                     expectedTotalCell.Style.NumberFormat.Format = "$#,##0.00";
 
+                    worksheet.Cell(row, col++).Value = dto.InvestmentTypeCategory;
+
+                    var equityValuationCell = worksheet.Cell(row, col++);
+                    equityValuationCell.Value = dto.EquityValuation;
+                    equityValuationCell.Style.NumberFormat.Format = "$#,##0.00";
+
+                    worksheet.Cell(row, col++).Value = dto.EquitySecurityType;
+                    worksheet.Cell(row, col++).Value = dto.FundTerm?.ToString("MM-dd-yyyy");
+                    worksheet.Cell(row, col++).Value = dto.EquityTargetReturn;
+                    worksheet.Cell(row, col++).Value = dto.DebtPaymentFrequency;
+                    worksheet.Cell(row, col++).Value = dto.DebtMaturityDate?.ToString("MM-dd-yyyy");
+                    worksheet.Cell(row, col++).Value = dto.DebtInterestRate;
                     worksheet.Cell(row, col++).Value = dto.CreatedDate?.ToString("MM-dd-yyyy");
+
+                    worksheet.Cell(row, col++).Value = dto.MetaTitle;
+                    worksheet.Cell(row, col++).Value = dto.MetaDescription;
                 }
 
                 worksheet.Columns().AdjustToContents();
@@ -1462,172 +1099,137 @@ namespace Invest.Controllers
             }
         }
 
-        [HttpGet("get-investment-document-url")]
-        public IActionResult GetInvestmentDocumentUrl(string pdfFileName, string action, string? originalPdfFileName = null)
+        [HttpGet("document")]
+        [ModuleAuthorize(PermissionType.View)]
+        public IActionResult Document(string action, string pdfFileName, string? originalPdfFileName = null)
         {
-            CommonResponse response = new();
-            try
+            if (string.IsNullOrEmpty(action) || string.IsNullOrEmpty(pdfFileName))
+                return Ok(new { Success = false, Message = "Parameters required." });
+
+            BlockBlobClient blobClient = _blobContainerClient.GetBlockBlobClient(pdfFileName);
+            var expiryTime = DateTimeOffset.UtcNow.AddMinutes(5);
+            string? sasUri = null;
+
+            switch (action)
             {
-                if (string.IsNullOrEmpty(action) || string.IsNullOrEmpty(pdfFileName))
-                {
-                    response.Success = false;
-                    response.Message = "Parameters required.";
-                    return Ok(response);
-                }
+                case "open":
+                    sasUri = blobClient.GenerateSasUri(BlobSasPermissions.Read, expiryTime).ToString();
+                    break;
 
-                BlockBlobClient blobClient = _blobContainerClient.GetBlockBlobClient(pdfFileName);
-                var expiryTime = DateTimeOffset.UtcNow.AddMinutes(5);
-                string? sasUri = null;
-
-                switch (action)
-                {
-                    case "open":
-                        sasUri = blobClient.GenerateSasUri(Azure.Storage.Sas.BlobSasPermissions.Read, expiryTime).ToString();
-                        break;
-
-                    case "download":
-                        var sasBuilder = new BlobSasBuilder
-                        {
-                            BlobContainerName = blobClient.BlobContainerName,
-                            BlobName = blobClient.Name,
-                            Resource = "b",
-                            ExpiresOn = expiryTime
-                        };
-
-                        sasBuilder.SetPermissions(BlobSasPermissions.Read);
-
-                        string downloadFileName = !string.IsNullOrEmpty(originalPdfFileName) ? Uri.UnescapeDataString(originalPdfFileName) : pdfFileName;
-
-                        sasBuilder.ContentDisposition = $"attachment; filename=\"{downloadFileName}\"";
-
-                        var sasToken = sasBuilder.ToSasQueryParameters(new StorageSharedKeyCredential(blobClient.AccountName, string.Empty)).ToString();
-
-                        var uriBuilder = new UriBuilder(blobClient.Uri)
-                        {
-                            Query = sasToken
-                        };
-                        sasUri = uriBuilder.Uri.ToString();
-                        break;
-                }
-
-                if (sasUri == null)
-                {
-                    response.Success = false;
-                    response.Message = "Failed to load document.";
-                    return BadRequest(response);
-                }
-
-                response.Success = true;
-                response.Message = sasUri;
-                return Ok(response);
-            }
-            catch (Exception ex)
-            {
-                response.Success = false;
-                response.Message = $"An error occurred: {ex.Message}";
-                return BadRequest(response);
-            }
-        }
-
-        [HttpPost("clone-investment")]
-        public async Task<IActionResult> CloneInvestment(int campaignId, string campaignName)
-        {
-            CommonResponse response = new();
-            try
-            {
-                campaignName = campaignName.Trim();
-                if (!string.IsNullOrEmpty(campaignName))
-                {
-                    bool nameExists = await _context.Campaigns.AnyAsync(x => x.Name!.Trim() == campaignName);
-
-                    if (nameExists)
+                case "download":
+                    var sasBuilder = new BlobSasBuilder
                     {
-                        response.Success = false;
-                        response.Message = "Campaign name already exists.";
-                        return Ok(response);
-                    }
-                }
+                        BlobContainerName = blobClient.BlobContainerName,
+                        BlobName = blobClient.Name,
+                        Resource = "b",
+                        ExpiresOn = expiryTime
+                    };
 
-                var campaign = await _context.Campaigns.FindAsync(campaignId);
-                if (campaign == null)
-                {
-                    response.Success = false;
-                    response.Message = "Campaign not found.";
-                    return Ok(response);
-                }
+                    sasBuilder.SetPermissions(BlobSasPermissions.Read);
 
-                var property = campaignName?.ToLower();
-                var withoutSpacesProperty = property?.Replace(" ", "");
-                var updatedProperty = withoutSpacesProperty + $"-qbe-{DateTime.Now.Year}";
+                    string downloadFileName = !string.IsNullOrEmpty(originalPdfFileName) ? Uri.UnescapeDataString(originalPdfFileName) : pdfFileName;
 
-                int counter = 1;
-                while (await _context.Campaigns.AnyAsync(x => x.Property == updatedProperty))
-                {
-                    updatedProperty = withoutSpacesProperty + $"-qbe-{DateTime.Now.Year}-{counter}";
-                    counter++;
-                }
+                    sasBuilder.ContentDisposition = $"attachment; filename=\"{downloadFileName}\"";
 
-                var createCampaign = new CampaignDto
-                {
-                    Name = campaignName,
-                    Description = campaign?.Description,
-                    Themes = campaign?.Themes,
-                    ApprovedBy = campaign?.ApprovedBy,
-                    SDGs = campaign?.SDGs,
-                    InvestmentTypes = campaign?.InvestmentTypes,
-                    Terms = campaign?.Terms,
-                    MinimumInvestment = campaign?.MinimumInvestment,
-                    Website = campaign?.Website,
-                    NetworkDescription = campaign?.NetworkDescription,
-                    ContactInfoFullName = campaign?.ContactInfoFullName,
-                    ContactInfoAddress = campaign?.ContactInfoAddress,
-                    ContactInfoAddress2 = campaign?.ContactInfoAddress2,
-                    ContactInfoEmailAddress = null,
-                    InvestmentInformationalEmail = null,
-                    ContactInfoPhoneNumber = campaign?.ContactInfoPhoneNumber,
-                    City = campaign?.City,
-                    State = campaign?.State,
-                    ZipCode = campaign?.ZipCode,
-                    ImpactAssetsFundingStatus = campaign?.ImpactAssetsFundingStatus,
-                    InvestmentRole = campaign?.InvestmentRole,
-                    Referred = campaign?.Referred,
-                    Target = campaign?.Target,
-                    Status = "0",
-                    TileImageFileName = campaign?.TileImageFileName,
-                    ImageFileName = campaign?.ImageFileName,
-                    PdfFileName = campaign?.PdfFileName,
-                    OriginalPdfFileName = campaign?.OriginalPdfFileName,
-                    LogoFileName = campaign?.LogoFileName,
-                    IsActive = false,
-                    Stage = InvestmentStage.New,
-                    Property = updatedProperty,
-                    AddedTotalAdminRaised = 0,
-                    GroupForPrivateAccessId = null,
-                    FundraisingCloseDate = campaign?.FundraisingCloseDate,
-                    MissionAndVision = campaign?.MissionAndVision,
-                    PersonalizedThankYou = campaign?.PersonalizedThankYou,
-                    HasExistingInvestors = campaign?.HasExistingInvestors,
-                    ExpectedTotal = campaign?.ExpectedTotal,
-                    EmailSends = false,
-                    CreatedDate = DateTime.Now,
-                    ModifiedDate = DateTime.Now
-                };
-                _context.Campaigns.Add(createCampaign);
-                await _context.SaveChangesAsync();
+                    var sasToken = sasBuilder.ToSasQueryParameters(new StorageSharedKeyCredential(blobClient.AccountName, _appSecrets.StorageSecretKey)).ToString();
 
-                response.Success = true;
-                response.Message = "Investment cloned successfully.";
-                return Ok(response);
+                    var uriBuilder = new UriBuilder(blobClient.Uri)
+                    {
+                        Query = sasToken
+                    };
+                    sasUri = uriBuilder.Uri.ToString();
+                    break;
             }
-            catch (Exception ex)
-            {
-                response.Success = false;
-                response.Message = $"An error occurred: {ex.Message}";
-                return BadRequest(response);
-            }
+
+            if (sasUri == null)
+                return BadRequest(new { Success = false, Message = "Failed to load document." });
+
+            return Ok(new { Success = true, Message = sasUri });
         }
 
-        [HttpGet("get-all-investment-themes-list")]
+        [HttpPost("{id}/clone")]
+        [ModuleAuthorize(PermissionType.Manage)]
+        public async Task<IActionResult> Clone(int id, string name)
+        {
+            name = name.Trim();
+            if (!string.IsNullOrEmpty(name))
+            {
+                bool nameExists = await _context.Campaigns.AnyAsync(x => x.Name!.Trim() == name);
+
+                if (nameExists)
+                    return Ok(new { Success = false, Message = "Campaign name already exists." });
+            }
+
+            var campaign = await _context.Campaigns.FirstOrDefaultAsync(x => x.Id == id);
+            if (campaign == null)
+                return Ok(new { Success = false, Message = "Campaign not found." });
+
+            var property = name?.ToLower();
+            var withoutSpacesProperty = property?.Replace(" ", "");
+            var updatedProperty = withoutSpacesProperty + $"-qbe-{DateTime.Now.Year}";
+
+            int counter = 1;
+            while (await _context.Campaigns.AnyAsync(x => x.Property == updatedProperty))
+            {
+                updatedProperty = withoutSpacesProperty + $"-qbe-{DateTime.Now.Year}-{counter}";
+                counter++;
+            }
+
+            var createCampaign = new CampaignDto
+            {
+                Name = name,
+                Description = campaign?.Description,
+                Themes = campaign?.Themes,
+                ApprovedBy = campaign?.ApprovedBy,
+                SDGs = campaign?.SDGs,
+                InvestmentTypes = campaign?.InvestmentTypes,
+                Terms = campaign?.Terms,
+                MinimumInvestment = campaign?.MinimumInvestment,
+                Website = campaign?.Website,
+                NetworkDescription = campaign?.NetworkDescription,
+                ContactInfoFullName = campaign?.ContactInfoFullName,
+                ContactInfoAddress = campaign?.ContactInfoAddress,
+                ContactInfoAddress2 = campaign?.ContactInfoAddress2,
+                ContactInfoEmailAddress = null,
+                InvestmentInformationalEmail = null,
+                ContactInfoPhoneNumber = campaign?.ContactInfoPhoneNumber,
+                Country = campaign?.Country,
+                OtherCountryAddress = campaign?.OtherCountryAddress,
+                City = campaign?.City,
+                State = campaign?.State,
+                ZipCode = campaign?.ZipCode,
+                ImpactAssetsFundingStatus = campaign?.ImpactAssetsFundingStatus,
+                InvestmentRole = campaign?.InvestmentRole,
+                Referred = campaign?.Referred,
+                Target = campaign?.Target,
+                Status = "0",
+                TileImageFileName = campaign?.TileImageFileName,
+                ImageFileName = campaign?.ImageFileName,
+                PdfFileName = campaign?.PdfFileName,
+                OriginalPdfFileName = campaign?.OriginalPdfFileName,
+                LogoFileName = campaign?.LogoFileName,
+                IsActive = false,
+                Stage = InvestmentStage.New,
+                Property = updatedProperty,
+                AddedTotalAdminRaised = 0,
+                GroupForPrivateAccessId = null,
+                FundraisingCloseDate = campaign?.FundraisingCloseDate,
+                MissionAndVision = campaign?.MissionAndVision,
+                PersonalizedThankYou = campaign?.PersonalizedThankYou,
+                HasExistingInvestors = campaign?.HasExistingInvestors,
+                ExpectedTotal = campaign?.ExpectedTotal,
+                EmailSends = false,
+                CreatedDate = DateTime.Now,
+                ModifiedDate = DateTime.Now
+            };
+            _context.Campaigns.Add(createCampaign);
+            await _context.SaveChangesAsync();
+
+            return Ok(new { Success = true, Message = "Investment cloned successfully." });
+        }
+
+        [HttpGet("themes")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<IActionResult> GetAllThemesList()
         {
             try
@@ -1638,9 +1240,7 @@ namespace Invest.Controllers
                                                     .ToListAsync();
 
                 if (investmentThemes != null)
-                {
                     return Ok(investmentThemes);
-                }
 
                 return BadRequest(new { Success = false, Message = "No investment themes found." });
             }
@@ -1650,43 +1250,62 @@ namespace Invest.Controllers
             }
         }
 
-        [HttpGet("get-all-investment-name-list")]
-        public async Task<IActionResult> GetAllInvestmentNameList(int investmentStage)
+        [HttpGet("names")]
+        [ModuleAuthorize(PermissionType.View)]
+        public async Task<IActionResult> GetNames(int stage, int id)
         {
-            try
+            var investmentTypes = await _context.InvestmentTypes.ToListAsync();
+
+            if (stage == 4)
             {
-                var investmentTypes = await _context.InvestmentTypes.ToListAsync();
+                var campaignList = await _context.Campaigns
+                                                .Where(x => x.Stage != InvestmentStage.ClosedNotInvested && x.Name!.Trim() != string.Empty)
+                                                .Select(x => new
+                                                {
+                                                    x.Id,
+                                                    x.Name,
+                                                    InvestmentTypeIds = x.InvestmentTypes
+                                                })
+                                                .OrderBy(x => x.Name)
+                                                .ToListAsync();
 
-                if (investmentStage == 4)
+                var result = campaignList.Select(c => new
                 {
-                    var campaignList = await _context.Campaigns
-                                                    .Where(x => x.Stage != InvestmentStage.ClosedNotInvested && x.Name!.Trim() != string.Empty)
-                                                    .Select(x => new
-                                                    {
-                                                        x.Id,
-                                                        x.Name,
-                                                        InvestmentTypeIds = x.InvestmentTypes
-                                                    })
-                                                    .OrderBy(x => x.Name)
-                                                    .ToListAsync();
+                    c.Id,
+                    c.Name,
+                    IsPrivateDebt = c.InvestmentTypeIds!
+                                            .Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                            .Select(id => int.Parse(id.Trim()))
+                                            .Select(id => investmentTypes.FirstOrDefault(t => t.Id == id)?.Name)
+                                            .Any(name => name != null && name.Contains("Private Debt"))
+                }).ToList();
 
-                    var result = campaignList.Select(c => new
-                    {
-                        c.Id,
-                        c.Name,
-                        IsPrivateDebt = c.InvestmentTypeIds!
-                                                .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                                                .Select(id => int.Parse(id.Trim()))
-                                                .Select(id => investmentTypes.FirstOrDefault(t => t.Id == id)?.Name)
-                                                .Any(name => name != null && name.Contains("Private Debt"))
-                    }).ToList();
+                return Ok(result);
+            }
+            else if (stage == 3)
+            {
+                var campaignList = await _context.Campaigns
+                                                .Where(x => x.Stage == InvestmentStage.ClosedInvested && x.Name!.Trim() != string.Empty)
+                                                .Select(x => new
+                                                {
+                                                    x.Id,
+                                                    x.Name
+                                                })
+                                                .OrderBy(x => x.Name)
+                                                .ToListAsync();
 
-                    return Ok(result);
-                }
-                else if (investmentStage == 3)
+                var result = campaignList.Select(c => new
                 {
-                    var campaignList = await _context.Campaigns
-                                                    .Where(x => x.Stage == InvestmentStage.ClosedInvested && x.Name!.Trim() != string.Empty)
+                    c.Id,
+                    c.Name
+                }).ToList();
+
+                return Ok(result);
+            }
+            else if (stage == 0)
+            {
+                var campaignList = await _context.Campaigns
+                                                    .Where(x => x.Name!.Trim() != string.Empty && x.Id != id)
                                                     .Select(x => new
                                                     {
                                                         x.Id,
@@ -1695,151 +1314,150 @@ namespace Invest.Controllers
                                                     .OrderBy(x => x.Name)
                                                     .ToListAsync();
 
-                    var result = campaignList.Select(c => new
-                    {
-                        c.Id,
-                        c.Name
-                    }).ToList();
-
-                    return Ok(result);
-                }
-                else if (investmentStage == 0)
+                var result = campaignList.Select(c => new
                 {
-                    var campaignList = await _context.Campaigns
-                                                        .Where(x => x.Name!.Trim() != string.Empty)
-                                                        .Select(x => new
-                                                        {
-                                                            x.Id,
-                                                            x.Name
-                                                        })
-                                                        .OrderBy(x => x.Name)
-                                                        .ToListAsync();
+                    c.Id,
+                    c.Name
+                }).ToList();
 
-                    var result = campaignList.Select(c => new
-                    {
-                        c.Id,
-                        c.Name
-                    }).ToList();
-
-                    return Ok(result);
-                }
-
-                return BadRequest(new { Success = false, Message = "Invalid investment stage." });
+                return Ok(result);
             }
-            catch (Exception ex)
+            else if (stage == 10)
             {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
+                var campaignList = await _context.Campaigns
+                                                .Where(x => (x.Stage == InvestmentStage.ClosedInvested
+                                                                || x.Stage == InvestmentStage.CompletedOngoing
+                                                                || x.Stage == InvestmentStage.CompletedOngoingPrivate)
+                                                                && x.Name!.Trim() != string.Empty)
+                                                .Select(x => new
+                                                {
+                                                    x.Id,
+                                                    x.Name
+                                                })
+                                                .OrderBy(x => x.Name)
+                                                .ToListAsync();
+
+                var result = campaignList.Select(c => new
+                {
+                    c.Id,
+                    c.Name
+                }).ToList();
+
+                return Ok(result);
             }
+
+            return BadRequest(new { Success = false, Message = "Invalid investment stage." });
         }
 
-        [HttpGet("get-all-investment-type-list")]
-        public async Task<IActionResult> GetAllInvestmentTypeList()
+        [HttpGet("types")]
+        [ModuleAuthorize(PermissionType.View)]
+        public async Task<IActionResult> GetTypes()
         {
-            try
-            {
-                var investmentTypes = await _context.InvestmentTypes
-                                            .Select(i => new { i.Id, i.Name })
-                                            .OrderBy(i => i.Name)
+            var investmentTypes = await _context.InvestmentTypes
+                                        .Select(i => new { i.Id, i.Name })
+                                        .OrderBy(i => i.Name)
+                                        .ToListAsync();
+
+            investmentTypes.Add(new { Id = -1, Name = (string?)"Other" });
+
+            if (investmentTypes != null)
+                return Ok(investmentTypes);
+
+            return BadRequest(new { Success = false, Message = "Invalid investment stage." });
+        }
+
+        [HttpGet("completed-investments")]
+        [ModuleAuthorize(PermissionType.View)]
+        public async Task<IActionResult> GetDetails([FromQuery] CompletedInvestmentsRequestDto requestDto)
+        {
+            if (requestDto.InvestmentId <= 0)
+                return Ok(new { Success = false, Message = "InvestmentId is required." });
+
+            var campaign = await _context.Campaigns
+                                            .Where(x => x.Id == requestDto.InvestmentId)
+                                            .FirstOrDefaultAsync();
+
+            var recommendations = await _context.Recommendations
+                                            .Where(r =>
+                                                    r != null &&
+                                                    r.Campaign != null &&
+                                                    (r.Status!.ToLower() == "approved" || r.Status.ToLower() == "pending") &&
+                                                    r.Campaign.Id == requestDto.InvestmentId &&
+                                                    r.Amount > 0 &&
+                                                    !string.IsNullOrWhiteSpace(r.UserEmail))
                                             .ToListAsync();
 
-                investmentTypes.Add(new { Id = -1, Name = (string?)"Other" });
+            var totalApprovedInvestmentAmount = recommendations?.Where(r => r.Status!.ToLower() == "approved")
+                                                                .Sum(r => r.Amount ?? 0) ?? 0;
 
-                if (investmentTypes != null)
-                {
-                    return Ok(investmentTypes);
-                }
+            var totalPendingInvestmentAmount = recommendations?.Where(r => r.Status!.ToLower() == "pending")
+                                                                .Sum(r => r.Amount ?? 0) ?? 0;
 
-                return BadRequest(new { Success = false, Message = "Invalid investment stage." });
-            }
-            catch (Exception ex)
+            var lastInvestmentDate = recommendations?
+                                        .OrderByDescending(x => x.Id)
+                                        .Select(x => x.DateCreated?.Date)
+                                        .FirstOrDefault();
+
+            CompletedInvestmentsResponseDto responseDto = new CompletedInvestmentsResponseDto
             {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
-            }
+                DateOfLastInvestment = lastInvestmentDate,
+                TypeOfInvestmentIds = campaign?.InvestmentTypes,
+                ApprovedRecommendationsAmount = totalApprovedInvestmentAmount,
+                PendingRecommendationsAmount = totalPendingInvestmentAmount,
+                InvestmentVehicle = requestDto.InvestmentVehicle
+            };
+
+            if (responseDto != null)
+                return Ok(responseDto);
+
+            return Ok(new { Success = false, Message = "No records found for the selected investment." });
         }
 
-        [HttpPost("get-completed-investments-details")]
-        public async Task<IActionResult> GetAllCompletedInvestmentsDetails([FromBody] CompletedInvestmentsRequestDto requestDto)
+        [HttpPost("completed-investments")]
+        [ModuleAuthorize(PermissionType.Manage)]
+        public async Task<IActionResult> SaveOrUpdate([FromBody] CompletedInvestmentsRequestDto requestDto)
         {
-            try
+            if (requestDto.InvestmentId <= 0)
+                return Ok(new { Success = false, Message = "InvestmentId is required." });
+
+            if (requestDto.TotalInvestmentAmount <= 0)
+                return Ok(new { Success = false, Message = "Amount must be greater than zero." });
+
+            if (string.IsNullOrEmpty(requestDto.InvestmentDetail))
+                return Ok(new { Success = false, Message = "Investment detail is required." });
+
+            if (requestDto.DateOfLastInvestment == null)
+                return Ok(new { Success = false, Message = "Last investment date is required." });
+
+            var identity = HttpContext.User.Identity as ClaimsIdentity;
+            var userId = identity?.Claims.FirstOrDefault(i => i.Type == "id")?.Value;
+
+            var investmentTypeIds = requestDto.TypeOfInvestmentIds?
+                                              .Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                              .Select(id => id.Trim())
+                                              .Where(id => id != "-1")
+                                              .ToList() ?? new List<string>();
+
+            if (!string.IsNullOrWhiteSpace(requestDto.TypeOfInvestmentIds)
+                && !string.IsNullOrWhiteSpace(requestDto.TypeOfInvestmentName)
+                && requestDto.TypeOfInvestmentIds.Split(',').Any(id => id.Trim() == "-1"))
             {
-                if (requestDto.InvestmentId <= 0)
+                var investmentType = new InvestmentType
                 {
-                    return Ok(new { Success = false, Message = "InvestmentId is required." });
-                }
-
-                var campaign = await _context.Campaigns
-                                                .Where(x => x.Id == requestDto.InvestmentId)
-                                                .FirstOrDefaultAsync();
-
-                var recommendations = await _context.Recommendations
-                                                .Where(r =>
-                                                        r != null &&
-                                                        r.Campaign != null &&
-                                                        (r.Status!.ToLower() == "approved" || r.Status.ToLower() == "pending") &&
-                                                        r.Campaign.Id == requestDto.InvestmentId &&
-                                                        r.Amount > 0 &&
-                                                        !string.IsNullOrWhiteSpace(r.UserEmail))
-                                                .ToListAsync();
-
-                var totalApprovedInvestmentAmount = recommendations?.Where(r => r.Status!.ToLower() == "approved")
-                                                                    .Sum(r => r.Amount ?? 0) ?? 0;
-
-                var totalPendingInvestmentAmount = recommendations?.Where(r => r.Status!.ToLower() == "pending")
-                                                                    .Sum(r => r.Amount ?? 0) ?? 0;
-
-                var lastInvestmentDate = recommendations?
-                                            .OrderByDescending(x => x.Id)
-                                            .Select(x => x.DateCreated?.Date)
-                                            .FirstOrDefault();
-
-                CompletedInvestmentsResponseDto responseDto = new CompletedInvestmentsResponseDto
-                {
-                    DateOfLastInvestment = lastInvestmentDate,
-                    TypeOfInvestmentIds = campaign?.InvestmentTypes,
-                    ApprovedRecommendationsAmount = totalApprovedInvestmentAmount,
-                    PendingRecommendationsAmount = totalPendingInvestmentAmount
+                    Name = requestDto.TypeOfInvestmentName.Trim()
                 };
 
-                if (responseDto != null)
-                {
-                    return Ok(responseDto);
-                }
+                _context.InvestmentTypes.Add(investmentType);
+                await _context.SaveChangesAsync();
 
-                return Ok(new { Success = false, Message = "No records found for the selected investment." });
+                investmentTypeIds.Add(investmentType.Id.ToString());
             }
-            catch (Exception ex)
-            {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
-            }
-        }
 
-        [HttpPost("save-completed-investments-details")]
-        public async Task<IActionResult> SaveCompletedInvestmentsDetails([FromBody] CompletedInvestmentsRequestDto requestDto)
-        {
-            try
-            {
-                if (requestDto.InvestmentId <= 0)
-                {
-                    return Ok(new { Success = false, Message = "InvestmentId is required." });
-                }
-                if (requestDto.TotalInvestmentAmount <= 0)
-                {
-                    return Ok(new { Success = false, Message = "Amount must be greater than zero." });
-                }
-                if (string.IsNullOrEmpty(requestDto.InvestmentDetail))
-                {
-                    return Ok(new { Success = false, Message = "Investment detail is required." });
-                }
-                if (requestDto.DateOfLastInvestment == null)
-                {
-                    return Ok(new { Success = false, Message = "Last investment date is required." });
-                }
+            var updatedTypeIds = string.Join(",", investmentTypeIds);
 
-                var campaign = await _context.Campaigns
-                                                .Where(x => x.Id == requestDto.InvestmentId)
-                                                .FirstOrDefaultAsync();
+            var campaign = await _context.Campaigns.Where(x => x.Id == requestDto.InvestmentId).FirstOrDefaultAsync();
 
-                var recommendations = await _context.Recommendations
+            var recommendations = await _context.Recommendations
                                                 .Where(r =>
                                                         r != null &&
                                                         r.Campaign != null &&
@@ -1849,240 +1467,306 @@ namespace Invest.Controllers
                                                         !string.IsNullOrWhiteSpace(r.UserEmail))
                                                 .ToListAsync();
 
-                var totalInvestors = recommendations?.Select(r => r.UserEmail).Distinct().Count() ?? 0;
-                var totalInvestmentAmount = recommendations?.Sum(r => r.Amount ?? 0) ?? 0;
+            var totalInvestors = recommendations?.Select(r => r.UserEmail).Distinct().Count() ?? 0;
 
-                var identity = HttpContext.User.Identity as ClaimsIdentity;
-                var userId = identity?.Claims.FirstOrDefault(i => i.Type == "id")?.Value;
+            var updatedTypeOfInvestmentIds = string.Join(",", investmentTypeIds);
 
-                var investmentTypeIds = requestDto.TypeOfInvestmentIds?
-                                                    .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                                                    .Select(id => id.Trim())
-                                                    .Where(id => id != "-1")
-                                                    .ToList() ?? new List<string>();
-
-                if (!string.IsNullOrWhiteSpace(requestDto.TypeOfInvestmentIds)
-                    && !string.IsNullOrWhiteSpace(requestDto.TypeOfInvestmentName)
-                    && requestDto.TypeOfInvestmentIds.Split(',').Any(id => id.Trim() == "-1"))
+            if (requestDto.Id == null || requestDto.Id == 0)
+            {
+                var entity = new CompletedInvestmentsDetails
                 {
-                    var investmentType = new InvestmentType
-                    {
-                        Name = requestDto.TypeOfInvestmentName?.Trim()
-                    };
-
-                    _context.InvestmentTypes.Add(investmentType);
-                    await _context.SaveChangesAsync();
-
-                    investmentTypeIds.Add(investmentType.Id.ToString());
-                }
-
-                var updatedTypeOfInvestmentIds = string.Join(",", investmentTypeIds);
-
-                var returnMaster = new CompletedInvestmentsDetails
-                {
-                    DateOfLastInvestment = requestDto.DateOfLastInvestment,
                     CampaignId = requestDto.InvestmentId,
                     InvestmentDetail = requestDto.InvestmentDetail,
-                    Amount = totalInvestmentAmount,
-                    TypeOfInvestment = updatedTypeOfInvestmentIds,
+                    Amount = requestDto.TotalInvestmentAmount,
+                    DateOfLastInvestment = requestDto.DateOfLastInvestment,
+                    TypeOfInvestment = updatedTypeIds,
                     Donors = totalInvestors,
                     Themes = campaign?.Themes,
+                    InvestmentVehicle = !string.IsNullOrWhiteSpace(requestDto.InvestmentVehicle) ? requestDto.InvestmentVehicle : null,
                     CreatedBy = userId!,
                     CreatedOn = DateTime.Now
                 };
 
-                _context.CompletedInvestmentsDetails.Add(returnMaster);
+                await _context.CompletedInvestmentsDetails.AddAsync(entity);
                 await _context.SaveChangesAsync();
 
                 return Ok(new { Success = true, Message = "Investment details saved successfully." });
             }
-            catch (Exception ex)
-            {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
-            }
+
+            var existing = await _context.CompletedInvestmentsDetails.FirstOrDefaultAsync(x => x.Id == requestDto.Id);
+
+            if (existing == null)
+                return Ok(new { Success = false, Message = "Record not found." });
+
+            decimal oldAmount = existing.Amount ?? 0m;
+
+            existing.InvestmentDetail = requestDto.InvestmentDetail;
+            existing.Amount = requestDto.TotalInvestmentAmount;
+            existing.DateOfLastInvestment = requestDto.DateOfLastInvestment;
+            existing.TypeOfInvestment = updatedTypeIds;
+            existing.SiteConfigurationId = requestDto.TransactionTypeId;
+            existing.InvestmentVehicle = requestDto.InvestmentVehicle;
+            existing.ModifiedOn = DateTime.Now;
+            await _context.SaveChangesAsync();
+
+            return Ok(new { Success = true, Message = "Investment details updated successfully." });
         }
 
-        [HttpPost("get-completed-investments-history")]
-        public async Task<IActionResult> GetAllCompletedInvestmentsHistory([FromBody] CompletedInvestmentsPaginationDto requestDto)
+        [HttpGet("completed-investments-history")]
+        [ModuleAuthorize(PermissionType.View)]
+        public async Task<IActionResult> Get([FromQuery] CompletedInvestmentsPaginationDto requestDto)
         {
-            try
-            {
-                var themes = await _context.Themes.ToListAsync();
-                var investmentTypes = await _context.InvestmentTypes.ToListAsync();
+            var selectedThemeIds = ParseCommaSeparatedIds(requestDto!.ThemesId);
+            var selectedInvestmentTypeIds = ParseCommaSeparatedIds(requestDto.InvestmentTypeId);
+            bool? isDeleted = requestDto.IsDeleted;
 
-                var selectedThemeIds = requestDto.ThemesId?
-                                                    .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                                                    .Select(id => int.TryParse(id.Trim(), out var val) ? val : (int?)null)
-                                                    .Where(id => id.HasValue)
-                                                    .Select(id => id!.Value)
-                                                    .ToList() ?? new List<int>();
+            var themes = await _context.Themes.ToListAsync();
+            var investmentTypes = await _context.InvestmentTypes.ToListAsync();
 
-                var selectedInvestmentTypeIds = requestDto.InvestmentTypeId?
-                                                            .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                                                            .Select(id => int.TryParse(id.Trim(), out var val) ? val : (int?)null)
-                                                            .Where(id => id.HasValue)
-                                                            .Select(id => id!.Value)
-                                                            .ToList() ?? new List<int>();
+            IQueryable<CompletedInvestmentsDetails> query = _context.CompletedInvestmentsDetails
+                                                                    .Include(x => x.Campaign)
+                                                                    .Include(x => x.SiteConfiguration)
+                                                                    .Include(x => x.DeletedByUser)
+                                                                    .ApplySoftDeleteFilter(isDeleted);
 
-                var completedInvestmentsCount = await _context.Campaigns.Where(x => x.Stage == InvestmentStage.ClosedInvested).CountAsync();
+            var completedDetails = await query.ToListAsync();
 
-                var recommendations = await _context.Recommendations
-                                                    .Where(r =>
-                                                            r != null &&
-                                                            r.Campaign != null &&
-                                                            (r.Status!.ToLower() == "approved" || r.Status.ToLower() == "pending") &&
-                                                            r.Amount > 0 &&
-                                                            !string.IsNullOrWhiteSpace(r.UserEmail))
-                                                    .ToListAsync();
+            var usersQuery = _context.Users
+                                     .Join(_context.UserRoles,
+                                         u => u.Id,
+                                         ur => ur.UserId,
+                                         (u, ur) => new { u, ur })
+                                     .Join(_context.Roles,
+                                         x => x.ur.RoleId,
+                                         r => r.Id,
+                                         (x, r) => new { x.u, r })
+                                     .Where(x => x.r.Name == UserRoles.User)
+                                     .Select(x => x.u);
 
-                var totalInvestors = recommendations?.Select(r => r.UserEmail?.ToLower().Trim()).Distinct().Count() ?? 0;
-                var totalInvestmentAmount = recommendations?.Sum(r => r.Amount ?? 0) ?? 0;
+            var userEmails = usersQuery.Select(u => u.Email);
 
-                var adminRole = await _context.Roles.FirstOrDefaultAsync(i => i.Name == "Admin");
-                var adminUsers = await _context.UserRoles
-                                        .Where(i => adminRole != null && i.RoleId == adminRole.Id)
-                                        .Select(i => i.UserId)
+            var recommendations = await _context.Recommendations
+                                                .Where(r =>
+                                                        userEmails.Contains(r.UserEmail!) &&
+                                                        r != null &&
+                                                        r.Campaign != null &&
+                                                        (r.Status!.ToLower() == "approved"
+                                                            || r.Status.ToLower() == "pending")
+                                                            && r.Amount > 0 &&
+                                                        !string.IsNullOrWhiteSpace(r.UserEmail))
+                                                .ToListAsync();
+
+            var totalInvestors = completedDetails.Select(x => x.Donors).Sum();
+            var totalInvestmentAmount = recommendations?.Sum(r => r.Amount ?? 0) ?? 0;
+
+            int completedCount = completedDetails.Count;
+
+            string lastCompletedDate = completedDetails
+                                        .Where(x => x.DateOfLastInvestment.HasValue)
+                                        .OrderByDescending(x => x.DateOfLastInvestment!.Value)
+                                        .Select(x => DateOnly.FromDateTime(x.DateOfLastInvestment!.Value).ToString("MM/dd/yyyy"))
+                                        .FirstOrDefault() ?? string.Empty;
+
+            var campaignIds = completedDetails.Select(c => c.CampaignId).ToList();
+
+            var recStats = await _context.Recommendations
+                                            .Where(r =>
+                                                userEmails.Contains(r.UserEmail!) &&
+                                                campaignIds.Contains(r.CampaignId!.Value) &&
+                                                (r.Status == "approved" || r.Status == "pending") &&
+                                                r.Amount > 0 &&
+                                                r.UserEmail != null)
+                                            .GroupBy(r => r.CampaignId)
+                                            .Select(g => new
+                                            {
+                                                CampaignId = g.Key!.Value,
+                                                CurrentBalance = g.Sum(x => x.Amount ?? 0),
+                                                NumberOfInvestors = g.Select(x => x.UserEmail!.ToLower()).Distinct().Count()
+                                            })
+                                            .ToDictionaryAsync(x => x.CampaignId);
+
+            var avatars = await _context.Recommendations
+                                        .Where(r =>
+                                            campaignIds.Contains(r.CampaignId!.Value) &&
+                                            (r.Status == "approved" || r.Status == "pending"))
+                                        .Join(_context.Users,
+                                                r => r.UserEmail,
+                                                u => u.Email,
+                                                (r, u) => new
+                                                {
+                                                    r.CampaignId,
+                                                    u.PictureFileName,
+                                                    u.ConsentToShowAvatar,
+                                                    r.Id
+                                                })
+                                        .Where(x => x.PictureFileName != null && x.ConsentToShowAvatar)
                                         .ToListAsync();
 
-                var totalUsersAccountBalance = await _context.Users
-                                                        .Where(i => !adminUsers.Contains(i.Id))
-                                                        .SumAsync(x => x.AccountBalance);
+            var avatarLookup = avatars
+                                .GroupBy(x => x.CampaignId!.Value)
+                                .ToDictionary(
+                                    g => g.Key,
+                                    g => g.OrderByDescending(x => x.Id)
+                                            .Select(x => x.PictureFileName)
+                                            .Distinct()
+                                            .Take(3)
+                                            .ToList()
+                                );
 
-                var query = await _context.CompletedInvestmentsDetails
-                                            .Include(x => x.Campaign)
-                                            .ToListAsync();
+            dynamic response = new ExpandoObject();
 
-                string lastCompletedInvestmentsDate = query
-                                                        .Where(x => x.DateOfLastInvestment.HasValue)
-                                                        .OrderByDescending(x => x.DateOfLastInvestment!.Value)
-                                                        .Select(x => DateOnly.FromDateTime(x.DateOfLastInvestment!.Value).ToString("MM/dd/yyyy"))
-                                                        .FirstOrDefault() ?? string.Empty;
+            var completedInvestmentsHistory = completedDetails
+                                                .Select(x =>
+                                                {
+                                                    var campaign = x.Campaign;
 
-                var completedInvestmentsHistory = query
-                                                    .Select(x =>
+                                                    var themeIds = ParseCommaSeparatedIds(campaign?.Themes);
+                                                    var invTypeIds = ParseCommaSeparatedIds(x.TypeOfInvestment);
+
+                                                    var themeNames = themes
+                                                                        .Where(t => themeIds.Contains(t.Id))
+                                                                        .OrderBy(t => t.Name)
+                                                                        .Select(t => t.Name)
+                                                                        .ToList();
+
+                                                    var investmentTypesNames = investmentTypes
+                                                                                .Where(i => invTypeIds.Contains(i.Id))
+                                                                                .OrderBy(i => i.Name)
+                                                                                .Select(i => i.Name)
+                                                                                .ToList();
+
+                                                    var dto = new CompletedInvestmentsHistoryResponseDto
                                                     {
-                                                        List<int> themeIds = x.Campaign?.Themes?
-                                                                                        .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                                                                                        .Select(id => int.TryParse(id.Trim(), out var val) ? val : (int?)null)
-                                                                                        .Where(id => id.HasValue)
-                                                                                        .Select(id => id!.Value)
-                                                                                        .ToList() ?? new List<int>();
+                                                        Id = x.Id,
+                                                        DateOfLastInvestment = x.DateOfLastInvestment,
+                                                        Name = campaign?.Name,
+                                                        CataCapFund = _context.Campaigns
+                                                                                .Where(c => c.Id == campaign!.AssociatedFundId)
+                                                                                .Select(c => c.Name)
+                                                                                .FirstOrDefault(),
+                                                        TileImageFileName = campaign!.TileImageFileName,
+                                                        Description = campaign.Description,
+                                                        Target = campaign.Target,
+                                                        InvestmentDetail = x.InvestmentDetail,
+                                                        TransactionType = x.SiteConfiguration?.Id,
+                                                        Stage = (campaign.Stage?.GetType()
+                                                                .GetField(campaign.Stage.ToString()!)?
+                                                                .GetCustomAttributes(typeof(DescriptionAttribute), false)?
+                                                                .FirstOrDefault() as DescriptionAttribute)?.Description
+                                                                ?? campaign.Stage.ToString(),
+                                                        TotalInvestmentAmount = Math.Round(x.Amount ?? 0, 0),
+                                                        TypeOfInvestment = string.Join(", ", investmentTypesNames),
+                                                        Donors = x.Donors,
+                                                        Property = campaign.Property,
+                                                        Themes = string.Join(", ", themeNames),
+                                                        InvestmentVehicle = x.InvestmentVehicle,
+                                                        ApprovedRecommendationsAmount = _context.Recommendations
+                                                                                                .Where(r =>
+                                                                                                    r.CampaignId == campaign.Id &&
+                                                                                                    r.Status!.ToLower() == "approved" &&
+                                                                                                    r.Amount > 0)
+                                                                                                .Sum(r => r.Amount ?? 0),
+                                                        LatestInvestorAvatars = avatarLookup.ContainsKey(campaign.Id!.Value)
+                                                                                ? avatarLookup[campaign.Id.Value]!
+                                                                                : new List<string>(),
+                                                        DeletedAt = x.DeletedAt,
+                                                        DeletedBy = x.DeletedByUser != null
+                                                                    ? $"{x.DeletedByUser.FirstName} {x.DeletedByUser.LastName}"
+                                                                    : null,
+                                                    };
 
-                                                        var themeNames = themes
-                                                                            .Where(t => themeIds.Contains(t.Id))
-                                                                            .OrderBy(t => t.Name)
-                                                                            .Select(t => t.Name)
-                                                                            .ToList();
+                                                    if (recStats.TryGetValue(campaign.Id!.Value, out var stats))
+                                                    {
+                                                        dto.CurrentBalance = stats.CurrentBalance + (campaign.AddedTotalAdminRaised ?? 0);
+                                                        dto.NumberOfInvestors = stats.NumberOfInvestors;
+                                                    }
 
-                                                        List<int> investmentTypesIds = x.TypeOfInvestment?
-                                                                                        .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                                                                                        .Select(id => int.TryParse(id.Trim(), out var val) ? val : (int?)null)
-                                                                                        .Where(id => id.HasValue)
-                                                                                        .Select(id => id!.Value)
-                                                                                        .ToList() ?? new List<int>();
+                                                    return new
+                                                    {
+                                                        CreatedOn = x.CreatedOn,
+                                                        ThemeIds = themeIds,
+                                                        InvestmentTypeIds = invTypeIds,
+                                                        Dto = dto
+                                                    };
+                                                })
+                                                .Where(x =>
+                                                    (selectedThemeIds?.Count == 0 || x.ThemeIds.Any(id => selectedThemeIds!.Contains(id))) &&
+                                                    (selectedInvestmentTypeIds?.Count == 0 || x.InvestmentTypeIds.Any(id => selectedInvestmentTypeIds!.Contains(id))) &&
+                                                    (string.IsNullOrEmpty(requestDto.SearchValue) ||
+                                                        (!string.IsNullOrEmpty(x.Dto.Name) && x.Dto.Name.Contains(requestDto.SearchValue, StringComparison.OrdinalIgnoreCase)) ||
+                                                        (!string.IsNullOrEmpty(x.Dto.InvestmentDetail) && x.Dto.InvestmentDetail.Contains(requestDto.SearchValue, StringComparison.OrdinalIgnoreCase)))
+                                                )
+                                                .ToList();
 
-                                                        var investmentTypesNames = investmentTypes
-                                                                                        .Where(i => investmentTypesIds.Contains(i.Id))
-                                                                                        .OrderBy(i => i.Name)
-                                                                                        .Select(i => i.Name)
-                                                                                        .ToList();
+            bool isAsc = requestDto?.SortDirection?.ToLower() == "asc";
+            string? sortField = requestDto?.SortField?.ToLower();
 
-                                                        return new
-                                                        {
-                                                            CreatedOn = x.CreatedOn,
-                                                            ThemeIds = themeIds,
-                                                            InvestmentTypeIds = investmentTypesIds,
-                                                            Dto = new CompletedInvestmentsHistoryResponseDto
-                                                            {
-                                                                DateOfLastInvestment = x.DateOfLastInvestment,
-                                                                InvestmentName = x.Campaign?.Name,
-                                                                InvestmentDetail = x.InvestmentDetail,
-                                                                TotalInvestmentAmount = x.Amount,
-                                                                TypeOfInvestment = string.Join(", ", investmentTypesNames),
-                                                                Donors = x.Donors,
-                                                                Property = x.Campaign?.Property,
-                                                                Themes = string.Join(", ", themeNames)
-                                                            }
-                                                        };
-                                                    })
-                                                    .Where(x =>
-                                                        (selectedThemeIds?.Count == 0 || x.ThemeIds.Any(id => selectedThemeIds!.Contains(id))) &&
-                                                        (selectedInvestmentTypeIds?.Count == 0 || x.InvestmentTypeIds.Any(id => selectedInvestmentTypeIds!.Contains(id))) &&
-                                                        (string.IsNullOrEmpty(requestDto.SearchValue) ||
-                                                         (!string.IsNullOrEmpty(x.Dto.InvestmentName) && x.Dto.InvestmentName.Contains(requestDto.SearchValue, StringComparison.OrdinalIgnoreCase)) ||
-                                                         (!string.IsNullOrEmpty(x.Dto.InvestmentDetail) && x.Dto.InvestmentDetail.Contains(requestDto.SearchValue, StringComparison.OrdinalIgnoreCase)))
-                                                    )
-                                                    .ToList();
-
-                bool isAsc = requestDto?.SortDirection?.ToLower() == "asc";
-                string? sortField = requestDto?.SortField?.ToLower();
-
-                completedInvestmentsHistory = sortField switch
-                {
-                    "dateoflastinvestment" => isAsc
-                        ? completedInvestmentsHistory.OrderBy(x => x.Dto.DateOfLastInvestment).ToList()
-                        : completedInvestmentsHistory.OrderByDescending(x => x.Dto.DateOfLastInvestment).ToList(),
-
-                    "investmentname" => isAsc
-                        ? completedInvestmentsHistory.OrderBy(x => x.Dto.InvestmentName).ToList()
-                        : completedInvestmentsHistory.OrderByDescending(x => x.Dto.InvestmentName).ToList(),
-
-                    "investmentdetail" => isAsc
-                        ? completedInvestmentsHistory.OrderBy(x => x.Dto.InvestmentDetail).ToList()
-                        : completedInvestmentsHistory.OrderByDescending(x => x.Dto.InvestmentDetail).ToList(),
-
-                    "totalinvestmentamount" => isAsc
-                        ? completedInvestmentsHistory.OrderBy(x => x.Dto.TotalInvestmentAmount).ToList()
-                        : completedInvestmentsHistory.OrderByDescending(x => x.Dto.TotalInvestmentAmount).ToList(),
-
-                    "donors" => isAsc
-                        ? completedInvestmentsHistory.OrderBy(x => x.Dto.Donors).ToList()
-                        : completedInvestmentsHistory.OrderByDescending(x => x.Dto.Donors).ToList(),
-
-                    "typeofinvestment" => isAsc
-                        ? completedInvestmentsHistory.OrderBy(x => x.Dto.TypeOfInvestment).ToList()
-                        : completedInvestmentsHistory.OrderByDescending(x => x.Dto.TypeOfInvestment).ToList(),
-
-                    "themes" => isAsc
-                        ? completedInvestmentsHistory.OrderBy(x => x.Dto.Themes).ToList()
-                        : completedInvestmentsHistory.OrderByDescending(x => x.Dto.Themes).ToList(),
-
-                    _ => completedInvestmentsHistory.OrderByDescending(x => x.CreatedOn).ThenBy(x => x.Dto.InvestmentName).ToList()
-                };
-
-                int totalCount = completedInvestmentsHistory.Count();
-
-                if (totalCount > 0)
-                {
-                    int currentPage = requestDto?.CurrentPage ?? 1;
-                    int perPage = requestDto?.PerPage ?? 10;
-
-                    var pagedReturns = completedInvestmentsHistory
-                                            .Skip((currentPage - 1) * perPage)
-                                            .Take(perPage)
-                                            .Select(x => x.Dto)
-                                            .ToList();
-
-                    dynamic response = new ExpandoObject();
-                    response.items = pagedReturns;
-                    response.totalCount = totalCount;
-                    response.completedInvestments = completedInvestmentsCount;
-                    response.totalInvestmentAmount = totalInvestmentAmount + totalUsersAccountBalance;
-                    response.totalInvestors = totalInvestors;
-                    response.lastCompletedInvestmentsDate = lastCompletedInvestmentsDate;
-
-                    return Ok(response);
-                }
-
-                return Ok(new { Success = false, Message = "No records found for completed investments." });
-            }
-            catch (Exception ex)
+            completedInvestmentsHistory = sortField switch
             {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
-            }
+                "dateoflastinvestment" => isAsc
+                    ? completedInvestmentsHistory.OrderBy(x => x.Dto.DateOfLastInvestment).ToList()
+                    : completedInvestmentsHistory.OrderByDescending(x => x.Dto.DateOfLastInvestment).ToList(),
+
+                "fund" => isAsc
+                    ? completedInvestmentsHistory.OrderBy(x => x.Dto.CataCapFund).ToList()
+                    : completedInvestmentsHistory.OrderByDescending(x => x.Dto.CataCapFund).ToList(),
+
+                "investmentname" => isAsc
+                    ? completedInvestmentsHistory.OrderBy(x => x.Dto.Name).ToList()
+                    : completedInvestmentsHistory.OrderByDescending(x => x.Dto.Name).ToList(),
+
+                "investmentdetail" => isAsc
+                    ? completedInvestmentsHistory.OrderBy(x => x.Dto.InvestmentDetail).ToList()
+                    : completedInvestmentsHistory.OrderByDescending(x => x.Dto.InvestmentDetail).ToList(),
+
+                "totalinvestmentamount" => isAsc
+                    ? completedInvestmentsHistory.OrderBy(x => x.Dto.TotalInvestmentAmount).ToList()
+                    : completedInvestmentsHistory.OrderByDescending(x => x.Dto.TotalInvestmentAmount).ToList(),
+
+                "donors" => isAsc
+                    ? completedInvestmentsHistory.OrderBy(x => x.Dto.Donors).ToList()
+                    : completedInvestmentsHistory.OrderByDescending(x => x.Dto.Donors).ToList(),
+
+                "typeofinvestment" => isAsc
+                    ? completedInvestmentsHistory.OrderBy(x => x.Dto.TypeOfInvestment).ToList()
+                    : completedInvestmentsHistory.OrderByDescending(x => x.Dto.TypeOfInvestment).ToList(),
+
+                "themes" => isAsc
+                    ? completedInvestmentsHistory.OrderBy(x => x.Dto.Themes).ToList()
+                    : completedInvestmentsHistory.OrderByDescending(x => x.Dto.Themes).ToList(),
+
+                _ => completedInvestmentsHistory.OrderByDescending(x => x.CreatedOn).ThenBy(x => x.Dto.Name).ToList()
+            };
+
+            response.totalCount = completedInvestmentsHistory.Count;
+
+            int currentPage = requestDto?.CurrentPage.GetValueOrDefault() ?? 0;
+            int perPage = requestDto?.PerPage.GetValueOrDefault() ?? 0;
+
+            bool hasPagination = currentPage > 0 && perPage > 0;
+
+            if (hasPagination)
+                response.items = completedInvestmentsHistory
+                                .Skip((currentPage - 1) * perPage)
+                                .Take(perPage)
+                                .Select(x => x.Dto)
+                                .ToList();
+            else
+                response.items = completedInvestmentsHistory.Select(x => x.Dto).ToList();
+
+            response.completedInvestments = completedCount;
+            response.totalInvestmentAmount = Math.Round(totalInvestmentAmount, 0);
+            response.totalInvestors = totalInvestors;
+            response.lastCompletedInvestmentsDate = lastCompletedDate;
+
+            if (response.totalCount == 0)
+                response.message = "No records found for completed investments.";
+
+            return Ok(response);
         }
 
         [HttpGet("export-completed-investments")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<IActionResult> ExportCompletedInvestments()
         {
             var themes = await _context.Themes.ToListAsync();
@@ -2125,7 +1809,7 @@ namespace Invest.Controllers
                                                 Dto = new CompletedInvestmentsHistoryResponseDto
                                                 {
                                                     DateOfLastInvestment = x.DateOfLastInvestment,
-                                                    InvestmentName = x.Campaign?.Name,
+                                                    Name = x.Campaign?.Name,
                                                     InvestmentDetail = x.InvestmentDetail,
                                                     TotalInvestmentAmount = x.Amount,
                                                     TypeOfInvestment = string.Join(", ", investmentTypesNames),
@@ -2135,7 +1819,7 @@ namespace Invest.Controllers
                                             };
                                         })
                                         .OrderByDescending(x => x.CreatedOn)
-                                        .ThenBy(x => x.Dto.InvestmentName)
+                                        .ThenBy(x => x.Dto.Name)
                                         .Select(x => x.Dto)
                                         .ToList();
 
@@ -2167,7 +1851,7 @@ namespace Invest.Controllers
                     int row = index + 2;
 
                     worksheet.Cell(row, 1).Value = dto.DateOfLastInvestment;
-                    worksheet.Cell(row, 2).Value = dto.InvestmentName;
+                    worksheet.Cell(row, 2).Value = dto.Name;
                     worksheet.Cell(row, 3).Value = dto.InvestmentDetail;
                     worksheet.Cell(row, 4).Value = $"${Convert.ToDecimal(dto.TotalInvestmentAmount):N2}";
                     worksheet.Cell(row, 4).Style.Alignment.Horizontal = XLAlignmentHorizontalValues.Right;
@@ -2191,18 +1875,15 @@ namespace Invest.Controllers
         }
 
         [HttpPost("calculate-returns")]
+        [ModuleAuthorize(PermissionType.Manage)]
         public async Task<IActionResult> CalculateReturns([FromBody] ReturnCalculationRequestDto requestDto)
         {
             try
             {
                 if (requestDto.InvestmentId <= 0)
-                {
                     return Ok(new { Success = false, Message = "InvestmentId is required." });
-                }
                 if (requestDto.ReturnAmount <= 0)
-                {
                     return Ok(new { Success = false, Message = "Return amount must be greater than zero." });
-                }
 
                 var campaignName = await _context.Campaigns.Where(x => x.Id == requestDto.InvestmentId).Select(x => x.Name).SingleOrDefaultAsync();
 
@@ -2262,22 +1943,17 @@ namespace Invest.Controllers
         }
 
         [HttpPost("save-returns")]
+        [ModuleAuthorize(PermissionType.Manage)]
         public async Task<IActionResult> SaveReturns([FromBody] ReturnCalculationRequestDto requestDto)
         {
             try
             {
                 if (requestDto.InvestmentId <= 0)
-                {
                     return Ok(new { Success = false, Message = "InvestmentId is required." });
-                }
                 if (requestDto.ReturnAmount <= 0)
-                {
                     return Ok(new { Success = false, Message = "Return amount must be greater than zero." });
-                }
                 if (string.IsNullOrEmpty(requestDto.MemoNote))
-                {
                     return Ok(new { Success = false, Message = "Admin memo is required." });
-                }
 
                 var allEmailTasks = new List<Task>();
 
@@ -2342,57 +2018,10 @@ namespace Invest.Controllers
                 return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
             }
         }
-        private async Task UpdateUsersWalletBalance(User user, decimal amount, string investmentName, int ReturnMastersId)
-        {
-            var accountBalanceChangeLog = new AccountBalanceChangeLog
-            {
-                UserId = user.Id,
-                PaymentType = $"Returned Amount, Return Masters Id= {ReturnMastersId}",
-                OldValue = user.AccountBalance,
-                UserName = user.UserName,
-                NewValue = user.AccountBalance + amount,
-                InvestmentName = investmentName
-            };
 
-            await _context.AccountBalanceChangeLogs.AddAsync(accountBalanceChangeLog);
-
-            user.AccountBalance += amount;
-
-            await _repository.UserAuthentication.UpdateUser(user);
-        }
-        private async Task SendReturnsEmail(string emailTo, string? firstName, string? lastName, string? investmentName, decimal returnedAmount)
-        {
-            string request = HttpContext.Request.Headers["Origin"].ToString();
-            string logoUrl = $"{request}/logo-for-email.png";
-            string logoHtml = $@"
-                                <div style='text-align: center;'>
-                                    <a href='https://investment-campaign.org' target='_blank'>
-                                        <img src='{logoUrl}' alt='Logo' width='300' height='150' />
-                                    </a>
-                                </div>";
-
-            string formattedAmount = string.Format(CultureInfo.GetCultureInfo("en-US"), "${0:N2}", returnedAmount);
-
-            string subject = "You Got Funded! Your Investment Campaign Is Growing";
-
-            var body = logoHtml + $@"
-                                    <html>
-                                        <body>
-                                            <p><b>Hi {firstName} {lastName},</b></p>
-                                            <p>Great news — <b>{investmentName}</b> just returned <b>{formattedAmount}</b> to your donor account on Investment Campaign!</p>
-                                            <p>Your available balance now reflects this amount and can be part of a new impact investment.</p>
-                                            <p style='margin-bottom: 0px;'>With deep gratitude,</p>
-                                            <p style='margin-top: 0px;'>— The Investment Campaign Team</p>
-                                            <p>🌍 <a href='https://investment-campaign.org/'>investment-campaign.org</a> | 💼 <a href='https://www.linkedin.com/company/investment-campaign-us/'>Follow us on LinkedIn</a></p>
-                                            <p><a href='{request}/settings' target='_blank'>Unsubscribe</a> from Investment Campaign notifications.</p>
-                                        </body>
-                                    </html>";
-
-            await _mailService.SendMailAsync(emailTo, subject, "", body);
-        }
-
-        [HttpPost("get-returns-history")]
-        public async Task<IActionResult> GetReturnsHistory([FromBody] ReturnsHistoryRequestDto requestDto)
+        [HttpGet("returns-history")]
+        [ModuleAuthorize(PermissionType.View)]
+        public async Task<IActionResult> GetReturnsHistory([FromQuery] ReturnsHistoryRequestDto requestDto)
         {
             try
             {
@@ -2404,9 +2033,7 @@ namespace Invest.Controllers
                                     .AsQueryable();
 
                 if (requestDto.InvestmentId > 0)
-                {
                     query = query?.Where(x => x.CampaignId == requestDto.InvestmentId);
-                }
 
                 List<ReturnMaster> returnMasters = await query!.ToListAsync();
 
@@ -2463,6 +2090,7 @@ namespace Invest.Controllers
         }
 
         [HttpGet("export-returns")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<IActionResult> ExportReturns()
         {
             var query = await _context.ReturnMasters
@@ -2560,166 +2188,8 @@ namespace Invest.Controllers
             }
         }
 
-        [HttpGet("get-campaign-data-for-thank-you-page")]
-        public async Task<IActionResult> GetCampaignData(int? campaignId, int? groupId)
-        {
-            try
-            {
-                CampaignDto? campaign = null;
-                if (campaignId != null || campaignId > 0)
-                    campaign = await _context.Campaigns.FirstOrDefaultAsync(c => c.Id == campaignId);
-
-                bool isFromGroup = false;
-                Group? group = null;
-                List<string> groupMemberEmails = new List<string>();
-
-                if (groupId != null || groupId > 0)
-                {
-                    isFromGroup = true;
-                    group = await _context.Groups.FindAsync(groupId);
-
-                    groupMemberEmails = await _context.Requests
-                                                      .Where(x => x.GroupToFollow!.Id == groupId
-                                                               && x.UserToFollow != null)
-                                                      .Select(x => x.UserToFollow!.Email)
-                                                      .ToListAsync();
-                }
-
-                int totalFellowDonorInvestors = isFromGroup
-                                                    ? await _context.Requests
-                                                                    .Where(x => x.GroupToFollow!.Id == groupId
-                                                                            && x.Status!.ToLower().Trim() == "accepted")
-                                                                    .Select(x => x.UserToFollow!.Id)
-                                                                    .Distinct()
-                                                                    .CountAsync()
-                                                    : await _context.Users.CountAsync(x => x.IsActive == true);
-
-                var totalRecommendationsAmount = isFromGroup
-                                                    ? await _context.Recommendations
-                                                                    .Where(r =>
-                                                                           groupMemberEmails.Contains(r.UserEmail!) &&
-                                                                           (r.Status == "approved" || r.Status == "pending") &&
-                                                                           r.CampaignId != null &&
-                                                                           r.Amount > 0)
-                                                                    .SumAsync(r => (decimal?)r.Amount) ?? 0
-                                                    : await _context.Recommendations
-                                                                    .Where(r =>
-                                                                        (r.Status == "approved" || r.Status == "pending") &&
-                                                                        r.CampaignId != null &&
-                                                                        r.Amount > 0 &&
-                                                                        r.UserEmail != null)
-                                                                    .SumAsync(r => (decimal?)r.Amount) ?? 0;
-
-                int totalCompletedInvestments = await _context.CompletedInvestmentsDetails.CountAsync();
-
-                string themeNamesStr = string.Empty;
-                List<MatchedCampaignsCardDto>? matchedCampaignsCardDtos = null;
-
-                if (campaignId > 0)
-                {
-                    List<int> themeIds = campaign?.Themes?
-                                                .Split(',', StringSplitOptions.RemoveEmptyEntries)
-                                                .Select(id => int.TryParse(id.Trim(), out var val) ? val : (int?)null)
-                                                .Where(id => id.HasValue)
-                                                .Select(id => id!.Value)
-                                                .ToList() ?? new List<int>();
-
-                    List<string> themeNames = _context.Themes
-                                                        .Where(t => themeIds.Contains(t.Id) && t.Name != null)
-                                                        .Select(t => t.Name!)
-                                                        .ToList();
-
-                    themeNamesStr = string.Join(", ", themeNames);
-
-                    var recommendationAggregates = await _context.Recommendations
-                                                                .Where(r => r.Amount > 0 &&
-                                                                            r.UserEmail != null &&
-                                                                            (r.Status == "approved" || r.Status == "pending"))
-                                                                .GroupBy(r => r.CampaignId)
-                                                                .Select(g => new
-                                                                {
-                                                                    CampaignId = g.Key,
-                                                                    CurrentBalance = g.Sum(r => (decimal?)r.Amount) ?? 0,
-                                                                    NumberOfInvestors = g.Select(r => r.UserEmail!).Distinct().Count()
-                                                                })
-                                                                .ToListAsync();
-
-                    var recsWithAvatars = await _context.Recommendations
-                                                        .Where(r => r.UserEmail != null && (r.Status == "approved" || r.Status == "pending") && r.CampaignId != null)
-                                                        .Join(_context.Users,
-                                                              r => r.UserEmail,
-                                                              u => u.Email,
-                                                              (r, u) => new { r.CampaignId, u.PictureFileName, r.Id })
-                                                        .Where(x => x.PictureFileName != null)
-                                                        .OrderByDescending(x => x.CampaignId)
-                                                        .ToListAsync();
-
-                    var avatarsLookup = recsWithAvatars
-                                                .GroupBy(x => x.CampaignId!.Value)
-                                                .ToDictionary(
-                                                    g => g.Key,
-                                                    g => g.OrderByDescending(x => x.Id)
-                                                          .Select(x => x.PictureFileName!)
-                                                          .Distinct()
-                                                          .Take(3)
-                                                          .ToList()
-                                                );
-
-                    if (themeIds.Any())
-                    {
-                        matchedCampaignsCardDtos = _context.Campaigns
-                                                            .Where(c => c.IsActive == true &&
-                                                                        c.Stage == InvestmentStage.Public &&
-                                                                        c.Id != campaign!.Id)
-                                                            .AsEnumerable()
-                                                            .Where(c => themeIds.Any(id =>
-                                                                    c.Themes == id.ToString() ||
-                                                                    c.Themes!.StartsWith(id + ",") ||
-                                                                    c.Themes.EndsWith("," + id) ||
-                                                                    c.Themes.Contains("," + id + ",")))
-                                                            .Select(c =>
-                                                            {
-                                                                var agg = recommendationAggregates.FirstOrDefault(a => a.CampaignId == c.Id);
-                                                                return new MatchedCampaignsCardDto
-                                                                {
-                                                                    Id = c.Id,
-                                                                    Name = c.Name!,
-                                                                    Description = c.Description!,
-                                                                    Target = c.Target!,
-                                                                    TileImageFileName = c.TileImageFileName!,
-                                                                    ImageFileName = c.ImageFileName!,
-                                                                    Property = c.Property!,
-                                                                    CurrentBalance = agg?.CurrentBalance ?? 0,
-                                                                    NumberOfInvestors = agg?.NumberOfInvestors ?? 0,
-                                                                    LatestInvestorAvatars = c.Id.HasValue && avatarsLookup.ContainsKey(c.Id.Value)
-                                                                                                ? avatarsLookup[c.Id.Value]
-                                                                                                : new List<string>()
-                                                                };
-                                                            })
-                                                            .OrderByDescending(c => c.CurrentBalance)
-                                                            .Take(3)
-                                                            .ToList();
-                    }
-                }
-
-                var campaignData = new
-                {
-                    themes = themeNamesStr,
-                    fellowDonorInvestors = totalFellowDonorInvestors,
-                    totalRaisedforImpact = totalRecommendationsAmount,
-                    completedInvestments = totalCompletedInvestments,
-                    matchedCampaigns = matchedCampaignsCardDtos
-                };
-
-                return Ok(campaignData);
-            }
-            catch (Exception ex)
-            {
-                return BadRequest(new { Success = false, Message = $"An error occurred: {ex.Message}" });
-            }
-        }
-
         [HttpGet("check-missing-investment-urls")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<IActionResult> CheckMissingInvestmentUrls()
         {
             try
@@ -2734,7 +2204,8 @@ namespace Invest.Controllers
             }
         }
 
-        [HttpGet("get-list-of-pdf-not-exist-on-azure")]
+        [HttpGet("list-of-pdf-not-exist-on-azure")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<IActionResult> GetNotExistPdfList()
         {
             try
@@ -2751,9 +2222,7 @@ namespace Invest.Controllers
                     var blobClient = _blobContainerClient.GetBlobClient(campaign.PdfFileName);
 
                     if (!await blobClient.ExistsAsync())
-                    {
                         missingCampaigns.Add(campaign?.Name!);
-                    }
                 }
 
                 return Ok(new { MissingFilesCampaignName = missingCampaigns });
@@ -2765,6 +2234,7 @@ namespace Invest.Controllers
         }
 
         [HttpGet("download-all-files-from-container")]
+        [ModuleAuthorize(PermissionType.View)]
         public async Task<IActionResult> DownloadAllFiles()
         {
             try
@@ -2799,26 +2269,503 @@ namespace Invest.Controllers
                 return BadRequest(new { message = "An error occurred.", error = ex.Message });
             }
         }
-    }
 
-    public class Data
-    {
-        public IEnumerable<Category> Theme { get; set; } = Enumerable.Empty<Category>();
-        public IEnumerable<Sdg> Sdg { get; set; } = Enumerable.Empty<Sdg>();
-        public IEnumerable<InvestmentType> InvestmentType { get; set; } = Enumerable.Empty<InvestmentType>();
-        public IEnumerable<ApprovedBy> ApprovedBy { get; set; } = Enumerable.Empty<ApprovedBy>();
-    }
+        private static List<int> ParseCommaSeparatedIds(string? input)
+        {
+            if (string.IsNullOrWhiteSpace(input)) return new List<int>();
 
-    public class Portfolio
-    {
-        public decimal? AccountBalance { get; set; }
-        public decimal? GroupBalance { get; set; }
-        public List<RecommendationsDto> Recommendations { get; set; } = new List<RecommendationsDto>();
-        public List<Campaign> Campaigns { get; set; } = new List<Campaign>();
-    }
+            return input.Split(',', StringSplitOptions.RemoveEmptyEntries)
+                        .Select(id => int.TryParse(id.Trim(), out var val) ? val : (int?)null)
+                        .Where(id => id.HasValue)
+                        .Select(id => id!.Value)
+                        .ToList();
+        }
 
-    public class NetworkRequest
-    {
-        public string Token { get; set; } = string.Empty;
+        private async Task UpdateUsersWalletBalance(User user, decimal amount, string investmentName, int ReturnMastersId)
+        {
+            var accountBalanceChangeLog = new AccountBalanceChangeLog
+            {
+                UserId = user.Id,
+                PaymentType = $"Returned Amount, Return Masters Id= {ReturnMastersId}",
+                OldValue = user.AccountBalance,
+                UserName = user.UserName,
+                NewValue = user.AccountBalance + amount,
+                InvestmentName = investmentName
+            };
+
+            await _context.AccountBalanceChangeLogs.AddAsync(accountBalanceChangeLog);
+
+            user.AccountBalance += amount;
+
+            await _repository.UserAuthentication.UpdateUser(user);
+        }
+
+        private async Task SendReturnsEmail(string emailTo, string? firstName, string? lastName, string? investmentName, decimal returnedAmount)
+        {
+            string request = HttpContext.Request.Headers["Origin"].ToString();
+            string logoUrl = $"{request}/logo-for-email.png";
+            string logoHtml = $@"
+                                <div style='text-align: center;'>
+                                    <a href='https://investment-campaign.org' target='_blank'>
+                                        <img src='{logoUrl}' alt='Logo' width='300' height='150' />
+                                    </a>
+                                </div>";
+
+            string formattedAmount = string.Format(CultureInfo.GetCultureInfo("en-US"), "${0:N2}", returnedAmount);
+
+            string subject = "You Got Funded! Your Investment Campaign Is Growing";
+
+            var body = logoHtml + $@"
+                                    <html>
+                                        <body>
+                                            <p><b>Hi {firstName} {lastName},</b></p>
+                                            <p>Great news — <b>{investmentName}</b> just returned <b>{formattedAmount}</b> to your donor account on Investment Campaign!</p>
+                                            <p>Your available balance now reflects this amount and can be part of a new impact investment.</p>
+                                            <p style='margin-bottom: 0px;'>With deep gratitude,</p>
+                                            <p style='margin-top: 0px;'>— The Investment Campaign Team</p>
+                                            <p>🌍 <a href='https://investment-campaign.org/'>investment-campaign.org</a> | 💼 <a href='https://www.linkedin.com/company/investment-campaign-us/'>Follow us on LinkedIn</a></p>
+                                            <p><a href='{request}/settings' target='_blank'>Unsubscribe</a> from Investment Campaign notifications.</p>
+                                        </body>
+                                    </html>";
+
+            await _mailService.SendMailAsync(emailTo, subject, "", body);
+        }
+
+        private async Task<IEnumerable<CampaignCardDtov2>> GetTrendingCampaignsCardDto()
+        {
+            var campaigns = await _context.Campaigns
+                                      .Where(i => i.IsActive!.Value &&
+                                                  (i.Stage == InvestmentStage.Public ||
+                                                  i.Stage == InvestmentStage.CompletedOngoing) &&
+                                                  i.GroupForPrivateAccessId == null)
+                                      .ToListAsync();
+
+            var campaignIds = campaigns.Select(c => c.Id).ToList();
+
+            var recStats = await _context.Recommendations
+                                         .Where(r =>
+                                             campaignIds.Contains(r.CampaignId!.Value) &&
+                                             (r.Status == "approved" || r.Status == "pending") &&
+                                             r.Amount > 0 &&
+                                             r.UserEmail != null)
+                                         .GroupBy(r => r.CampaignId)
+                                         .Select(g => new
+                                         {
+                                             CampaignId = g.Key!.Value,
+                                             CurrentBalance = g.Sum(x => x.Amount ?? 0),
+                                             NumberOfInvestors = g.Select(x => x.UserEmail!.ToLower()).Distinct().Count()
+                                         })
+                                         .ToDictionaryAsync(x => x.CampaignId);
+
+            var avatars = await _context.Recommendations
+                                        .Where(r =>
+                                            campaignIds.Contains(r.CampaignId!.Value) &&
+                                            (r.Status == "approved" || r.Status == "pending"))
+                                        .Join(_context.Users,
+                                                r => r.UserEmail,
+                                                u => u.Email,
+                                                (r, u) => new
+                                                {
+                                                    r.CampaignId,
+                                                    u.PictureFileName,
+                                                    u.ConsentToShowAvatar,
+                                                    r.Id
+                                                })
+                                        .Where(x => x.PictureFileName != null && x.ConsentToShowAvatar)
+                                        .ToListAsync();
+
+            var avatarLookup = avatars
+                               .GroupBy(x => x.CampaignId!.Value)
+                               .ToDictionary(
+                                   g => g.Key,
+                                   g => g.OrderByDescending(x => x.Id)
+                                           .Select(x => x.PictureFileName)
+                                           .Distinct()
+                                           .Take(3)
+                                           .ToList()
+                               );
+
+            var resultDtos = campaigns.Select(c =>
+            {
+                var dto = _mapper.Map<CampaignCardDtov2>(c);
+
+                if (recStats.TryGetValue(c.Id!.Value, out var stats))
+                {
+                    dto.CurrentBalance = stats.CurrentBalance + (c.AddedTotalAdminRaised ?? 0);
+                    dto.NumberOfInvestors = stats.NumberOfInvestors;
+                }
+
+                dto.LatestInvestorAvatars = avatarLookup.ContainsKey(c.Id.Value) ? avatarLookup[c.Id.Value]! : new List<string>();
+
+                return dto;
+            })
+            .OrderByDescending(c => c.NumberOfInvestors)
+            .ThenByDescending(c => c.CurrentBalance)
+            .Take(6)
+            .ToList();
+
+            return resultDtos;
+        }
+
+        private static string ReplaceSiteConfigTokens(string html, Dictionary<string, string> siteConfigs)
+        {
+            if (string.IsNullOrWhiteSpace(html))
+                return html;
+
+            return System.Text.RegularExpressions.Regex.Replace(html, @"\{(.*?)\}", match =>
+            {
+                var key = match.Groups[1].Value.Trim();
+
+                if (!siteConfigs.TryGetValue(key, out var value) || string.IsNullOrWhiteSpace(value))
+                    return string.Empty;
+
+                return RemoveOuterPTags(value);
+
+            }, System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        }
+
+        private static string RemoveOuterPTags(string html)
+        {
+            html = html.Trim();
+
+            var match = System.Text.RegularExpressions.Regex.Match(html, @"^\s*<p[^>]*>(.*?)<\/p>\s*$",
+                System.Text.RegularExpressions.RegexOptions.Singleline | System.Text.RegularExpressions.RegexOptions.IgnoreCase
+            );
+
+            return match.Success ? match.Groups[1].Value.Trim() : html;
+        }
+
+        private async Task<Dictionary<string, string?>> UploadCampaignFiles(Campaign campaign)
+        {
+            var filesToUpload = new Dictionary<string, (string? Base64, string Extension)>
+            {
+                ["PDFPresentation"] = (campaign.PDFPresentation, ".pdf"),
+                ["Image"] = (campaign.Image, ".jpg"),
+                ["TileImage"] = (campaign.TileImage, ".jpg"),
+                ["Logo"] = (campaign.Logo, ".jpg")
+            };
+
+            var uploadTasks = filesToUpload.Where(f => !string.IsNullOrWhiteSpace(f.Value.Base64))
+                                           .ToDictionary(
+                                               f => f.Key,
+                                               f => UploadBase64File(f.Value.Base64!, f.Value.Extension)
+                                           );
+
+            await Task.WhenAll(uploadTasks.Values);
+
+            var result = uploadTasks.ToDictionary(
+                                        f => f.Key,
+                                        f => (string?)f.Value.Result
+                                    );
+
+            return result;
+        }
+
+        private async Task<string> UploadBase64File(string base64Data, string extension)
+        {
+            if (string.IsNullOrWhiteSpace(base64Data))
+                return string.Empty;
+
+            string fileName = $"{Guid.NewGuid()}{extension}";
+            var blob = _blobContainerClient.GetBlockBlobClient(fileName);
+
+            var dataIndex = base64Data.Substring(base64Data.IndexOf(',') + 1);
+            var bytes = Convert.FromBase64String(dataIndex);
+
+            using var stream = new MemoryStream(bytes);
+            await blob.UploadAsync(stream);
+
+            return fileName;
+        }
+
+        private void PreserveAdminFields(CampaignDto existing, Campaign update)
+        {
+            update.MinimumInvestment = existing.MinimumInvestment;
+            update.ApprovedBy = existing.ApprovedBy;
+            update.Stage = existing.Stage;
+            update.GroupForPrivateAccessDto = _mapper.Map<GroupDto>(existing.GroupForPrivateAccess);
+            update.Property = existing.Property;
+            update.AddedTotalAdminRaised = existing.AddedTotalAdminRaised;
+            update.IsActive = existing.IsActive;
+        }
+
+        private async Task SendUpdateCampaignEmails(CampaignDto existing, Campaign campaign)
+        {
+            if (_appSecrets.IsProduction)
+            {
+                if (existing?.Stage == InvestmentStage.Public && campaign.Stage == InvestmentStage.Private)
+                {
+                    var variables = new Dictionary<string, string>
+                    {
+                        { "date", DateTime.Now.ToString("MM/dd/yyyy") },
+                        { "investmentLink", $"{_appSecrets.RequestOrigin}/investments/{campaign.Property}" },
+                        { "campaignName", campaign.Name! }
+                    };
+
+                    _emailQueue.QueueEmail(async (sp) =>
+                    {
+                        var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                        await emailService.SendTemplateEmailAsync(
+                            EmailTemplateCategory.InvestmentApproved,
+                            "test@gmail.com",
+                            variables
+                        );
+                    });
+                }
+            }
+
+            if (campaign.Stage == InvestmentStage.ComplianceReview)
+            {
+                var variables = new Dictionary<string, string>
+                {
+                    { "campaignName", campaign.Name! }
+                };
+
+                _emailQueue.QueueEmail(async (sp) =>
+                {
+                    var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                    var subjectPrefix = _appSecrets.IsProduction ? "" : "QA - ";
+
+                    await emailService.SendTemplateEmailAsync(
+                        EmailTemplateCategory.ComplianceReviewNotification,
+                        "test@gmail.com",
+                        variables,
+                        subjectPrefix
+                    );
+                });
+            }
+        }
+
+        private async Task SendCreateCampaignEmails(Campaign campaign, CampaignDto mappedCampaign, string userEmail)
+        {
+            var tasks = new List<Task>();
+
+            if (_appSecrets.IsProduction)
+            {
+                var parsIdSdgs = campaign?.SDGs?.Split(',').Select(id => int.Parse(id)).ToList();
+                var parsIdInvestmentTypes = campaign?.InvestmentTypes?.Split(',').Select(id => int.Parse(id)).ToList();
+                var parsIdThemes = campaign?.Themes?.Split(',').Select(id => int.Parse(id)).ToList();
+
+                var sdgNames = _context.SDGs.Where(c => parsIdSdgs!.Contains(c.Id)).Select(c => c.Name).ToList();
+                var themeNames = _context.Themes.Where(c => parsIdThemes!.Contains(c.Id)).Select(c => c.Name).ToList();
+                var investmentTypeNames = _context.InvestmentTypes.Where(c => parsIdInvestmentTypes!.Contains(c.Id)).Select(c => c.Name).ToList();
+
+                var sdgNamesString = string.Join(", ", sdgNames);
+                var themeNamesString = string.Join(", ", themeNames);
+                var investmentTypeNamesString = string.Join(", ", investmentTypeNames);
+
+                var campaignVariables = new Dictionary<string, string>
+                {
+                    { "userFullName", $"{campaign!.FirstName} {campaign.LastName}" },
+                    { "ownerEmail", campaign.ContactInfoEmailAddress ?? "" },
+                    { "informationalEmail", campaign.InvestmentInformationalEmail ?? "" },
+                    { "mobileNumber", campaign.ContactInfoPhoneNumber ?? "" },
+                    { "addressLine1", campaign.ContactInfoAddress ?? "" },
+                    { "investmentName", campaign.Name ?? "" },
+                    { "investmentDescription", campaign.Description ?? "" },
+                    { "website", campaign.Website ?? "" },
+                    { "investmentTypes", investmentTypeNamesString },
+                    { "terms", campaign.Terms ?? "" },
+                    { "target", campaign.Target?.ToString() ?? "" },
+                    { "fundraisingCloseDate", campaign.FundraisingCloseDate?.ToString() ?? "" },
+                    { "themes", themeNamesString },
+                    { "sdgs", sdgNamesString },
+                    { "impactAssetsFundingStatus", campaign.ImpactAssetsFundingStatus ?? "" },
+                    { "investmentRole", campaign.InvestmentRole ?? "" },
+
+                    { "addressLine2Section", string.IsNullOrWhiteSpace(campaign.ContactInfoAddress2) ? "" : $"<p>Address Line 2: {campaign.ContactInfoAddress2}</p><br/>" },
+                    { "citySection", string.IsNullOrWhiteSpace(campaign.City) ? "" : $"<p>City: {campaign.City}</p><br/>" },
+                    { "stateSection", string.IsNullOrWhiteSpace(campaign.State) ? "" : $"<p>State: {campaign.State}</p><br/>" },
+                    { "zipCodeSection", string.IsNullOrWhiteSpace(campaign.ZipCode) ? "" : $"<p>Zip Code: {campaign.ZipCode}</p><br/>" }
+                };
+
+                _emailQueue.QueueEmail(async (sp) =>
+                {
+                    var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                    await emailService.SendTemplateEmailAsync(
+                        EmailTemplateCategory.InvestmentSubmissionNotification,
+                        "test@gmail.com",
+                        campaignVariables
+                    );
+                });
+
+                var catacapAdminVariables = new Dictionary<string, string>
+                {
+                    { "date", DateTime.Now.ToString("M/d/yyyy") },
+                    { "campaignName", mappedCampaign.Name! }
+                };
+
+                _emailQueue.QueueEmail(async (sp) =>
+                {
+                    var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                    await emailService.SendTemplateEmailAsync(
+                        EmailTemplateCategory.InvestmentPublished,
+                        "test@gmail.com",
+                        catacapAdminVariables
+                    );
+                });
+            }
+
+            var variables = new Dictionary<string, string>
+            {
+                { "fullName", $"{campaign!.FirstName!} {campaign.LastName!}" },
+                { "investmentName", campaign.Name! },
+                { "preLaunchToolkitUrl", "preLaunchToolkitUrl" },
+                { "partnerBenefitsUrl", "partnerBenefitsUrl" },
+                { "faqPageUrl", "faqPageUrl" },
+                { "unsubscribeUrl", $"{_appSecrets.RequestOrigin}/settings" }
+            };
+
+            _emailQueue.QueueEmail(async (sp) =>
+            {
+                var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                await emailService.SendTemplateEmailAsync(
+                    EmailTemplateCategory.InvestmentUnderReview,
+                    userEmail,
+                    variables
+                );
+            });
+        }
+
+        private async Task<bool> VerifyCaptcha(string token)
+        {
+            var requestContent = new FormUrlEncodedContent(new[]
+            {
+                new KeyValuePair<string, string>("secret", _appSecrets.CaptchaSecretKey),
+                new KeyValuePair<string, string>("response", token)
+            });
+
+            var response = await _httpClient.PostAsync("https://hcaptcha.com/siteverify", requestContent);
+
+            var content = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(content);
+            bool isSuccess = doc.RootElement.GetProperty("success").GetBoolean();
+
+            return isSuccess;
+        }
+
+        private async Task<User> RegisterAnonymousUser(string firstName, string lastName, string email)
+        {
+            var userName = $"{firstName}{lastName}".Replace(" ", "").Trim().ToLower();
+            Random random = new Random();
+            while (_context.Users.Any(x => x.UserName == userName))
+            {
+                userName = $"{userName}{random.Next(0, 100)}".ToLower();
+            }
+
+            UserRegistrationDto registrationDto = new UserRegistrationDto()
+            {
+                FirstName = firstName,
+                LastName = lastName,
+                UserName = userName,
+                Password = _appSecrets.DefaultPassword,
+                Email = email
+            };
+
+            await _repository.UserAuthentication.RegisterUserAsync(registrationDto, UserRoles.User);
+
+            var user = await _repository.UserAuthentication.GetUserByUserName(userName);
+            user.IsFreeUser = true;
+            await _repository.UserAuthentication.UpdateUser(user);
+            await _repository.SaveAsync();
+
+            var variables = new Dictionary<string, string>
+            {
+                { "firstName", firstName! },
+                { "userName", userName },
+                { "resetPasswordUrl", $"{_appSecrets.RequestOrigin}/forgotpassword" },
+                { "siteUrl", _appSecrets.RequestOrigin }
+            };
+
+            _emailQueue.QueueEmail(async (sp) =>
+            {
+                var emailService = sp.GetRequiredService<IEmailTemplateService>();
+
+                await emailService.SendTemplateEmailAsync(
+                    EmailTemplateCategory.WelcomeAnonymousUser,
+                    email,
+                    variables
+                );
+            });
+
+            return user;
+        }
+
+        private async Task<IEnumerable<CampaignCardDto>> GetCampaignsCardDto(string? sourcedBy = null)
+        {
+            if (_context.Campaigns == null)
+            {
+                return null!;
+            }
+
+            var sourcedByNamesList = sourcedBy?.ToLower().Split(',').Select(n => n.Trim()).ToList();
+
+            var approvedBy = sourcedByNamesList == null || !sourcedByNamesList.Any()
+                            ? new List<int>()
+                            : await _context.ApprovedBy
+                                            .Where(x => sourcedByNamesList.Contains(x.Name!.ToLower()))
+                                            .Select(x => x.Id)
+                                            .ToListAsync();
+
+            var campaigns = await _context.Campaigns
+                                            .Where(i => i.IsActive!.Value &&
+                                                    (i.Stage == InvestmentStage.Public
+                                                        || i.Stage == InvestmentStage.CompletedOngoing)
+                                                    )
+                                            .Include(i => i.GroupForPrivateAccess)
+                                            .ToListAsync();
+
+            if (approvedBy.Any())
+            {
+                campaigns = campaigns
+                                .Where(c => !string.IsNullOrWhiteSpace(c.ApprovedBy) &&
+                                            approvedBy.Any(id => c.ApprovedBy
+                                                .Split(',', StringSplitOptions.RemoveEmptyEntries)
+                                                .Select(s => s.Trim())
+                                                .Where(s => int.TryParse(s, out _))
+                                                .Select(int.Parse)
+                                                .Contains(id)))
+                                .ToList();
+            }
+
+            var data = campaigns
+                              .Select(c => new
+                              {
+                                  Campaign = c,
+                                  Recommendations = _context.Recommendations
+                                                            .Where(r => r.Campaign != null &&
+                                                                    r.Campaign.Id == c.Id &&
+                                                                    (r.Status!.ToLower() == "approved" || r.Status.ToLower() == "pending") &&
+                                                                    r.Amount > 0 &&
+                                                                    r.UserEmail != null)
+                                                            .GroupBy(r => r.Campaign!.Id)
+                                                            .Select(g => new
+                                                            {
+                                                                CurrentBalance = g.Sum(r => r.Amount ?? 0),
+                                                                NumberOfInvestors = g.Select(r => r.UserEmail!.ToLower().Trim()).Distinct().Count()
+                                                            })
+                                                            .FirstOrDefault()
+                              })
+                              .ToList();
+
+            var result = data.Select(item =>
+            {
+                var campaignDto = _mapper.Map<CampaignCardDto>(item.Campaign);
+                if (item.Recommendations != null)
+                {
+                    campaignDto.CurrentBalance = item.Recommendations.CurrentBalance + (item.Campaign.AddedTotalAdminRaised ?? 0);
+                    campaignDto.NumberOfInvestors = item.Recommendations.NumberOfInvestors;
+                }
+                campaignDto.GroupForPrivateAccessDto = _mapper.Map<GroupDto>(item.Campaign.GroupForPrivateAccess);
+                return campaignDto;
+            }).ToList();
+
+            return result;
+        }
     }
 }

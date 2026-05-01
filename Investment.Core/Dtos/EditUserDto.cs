@@ -11,15 +11,17 @@
         public string Address { get; set; } = string.Empty;
         public decimal AccountBalance { get; set; }
         public string UserName { get; set; } = string.Empty;
-        public bool IsApprouveRequired { get; set; } = false;
-        public bool IsUserHidden { get; set; } = false;
-        public bool EmailFromGroupsOn { get; set; } = false;
-        public bool EmailFromUsersOn { get; set; } = false;
-        public bool OptOutEmailNotifications { get; set; } = false;
-        public bool Feedback { get; set; } = false;
-        public bool IsFreeUser { get; set; } = false;
-        public bool IsAnonymousInvestment { get; set; } = false;
+        public bool IsApprouveRequired { get; set; }
+        public bool IsUserHidden { get; set; }
+        public bool EmailFromGroupsOn { get; set; }
+        public bool EmailFromUsersOn { get; set; }
+        public bool OptOutEmailNotifications { get; set; }
+        public bool Feedback { get; set; }
+        public bool? IsFreeUser { get; set; }
+        public bool? IsAnonymousInvestment { get; set; }
+        public bool ConsentToShowAvatar { get; set; }
         public List<string>? GroupLinks { get; set; }
-        public int? InvestmentId { get; set; }
+        public bool HasInvestments { get; set; }
+        public string? ZipCode { get; set; }
     }
 }
